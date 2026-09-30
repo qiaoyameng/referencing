@@ -66,6 +66,14 @@ referencing.exceptions
    :undoc-members:
 
 
+referencing.packaging
+^^^^^^^^^^^^^^^^^^^^^
+
+.. automodule:: referencing.packaging
+   :members:
+   :undoc-members:
+
+
 referencing.retrieval
 ^^^^^^^^^^^^^^^^^^^^^
 

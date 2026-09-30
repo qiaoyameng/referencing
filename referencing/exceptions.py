@@ -163,3 +163,23 @@ class InvalidAnchor(Unresolvable):
             f"to use '#/{self.anchor}', as the slash is required *before each "
             "segment* of a JSON pointer."
         )
+
+
+@frozen
+class DigestMismatch(Exception):
+    """
+    A packaged resource's contents no longer match their recorded digest.
+
+    Raised while loading a package, after its manifest has detected that a
+    document was modified (or corrupted) since the package was created.
+    """
+
+    uri: str
+    expected: str
+    got: str
+
+    def __str__(self) -> str:
+        return (
+            f"Content digest mismatch for {self.uri!r}: "
+            f"expected {self.expected!r}, found {self.got!r}."
+        )

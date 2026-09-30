@@ -2,6 +2,12 @@
 Changelog
 =========
 
+Next release
+------------
+
+* Add `referencing.pack`, `referencing.Package` and related manifest APIs, for bundling a `Resource` together with the resources it references into a self-contained, digest-verified package which loads into a `Registry` that is fully offline.
+  The package is produced using a new reference-enumeration capability on `Specification`, which distinguishes normal references from dynamic anchors and ignores same-named keys in non-schema data.
+
 v0.37.0
 -------
 

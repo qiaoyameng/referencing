@@ -36,6 +36,47 @@ class _MaybeInSubresource(Protocol[D]):
     ) -> Resolver[D]: ...
 
 
+class ReferenceKind(Enum):
+    """
+    The kind of a `Reference` found within a document.
+    """
+
+    #: A normal (static) reference, e.g. a JSON Schema ``$ref``.
+    STATIC = "static"
+
+    #: A dynamic reference which may be overridden via dynamic scope,
+    #: e.g. a JSON Schema 2020-12 ``$dynamicRef`` or a draft 2019-09
+    #: ``$recursiveRef``.
+    DYNAMIC = "dynamic"
+
+
+@frozen
+class Reference:
+    """
+    A reference enumerated from within a document.
+
+    References are produced by a `Specification`'s reference-enumeration
+    capability (`Specification.references_in`), so they are only found in
+    locations which the specification treats as references -- a ``$ref``
+    appearing in non-schema data (e.g. as a property name or inside an
+    ``enum``) is not a reference and is not enumerated.
+    """
+
+    #: Whether the reference is a normal reference or a dynamic one.
+    kind: ReferenceKind
+
+    #: The raw reference target, as written in the document (e.g. a URI,
+    #: possibly relative, or a fragment-only reference).
+    target: URI
+
+
+def _no_references(
+    specification: Specification[D],
+    contents: D,
+) -> Iterable[Reference]:
+    return ()
+
+
 def _detect_or_error(contents: D) -> Specification[D]:
     if not isinstance(contents, Mapping):
         raise exceptions.CannotDetermineSpecification(contents)
@@ -111,6 +152,13 @@ class Specification(Generic[D]):
         Iterable[AnchorType[D]],
     ] = field(alias="anchors_in")
 
+    #: Enumerate the references contained directly in the given document
+    #: (i.e. without recursing into subresources).
+    _references_in: Callable[
+        [Specification[D], D],
+        Iterable[Reference],
+    ] = field(default=_no_references, alias="references_in")
+
     #: An opaque specification where resources have no subresources
     #: nor internal identifiers.
     OPAQUE: ClassVar[Specification[Any]]
@@ -156,6 +204,18 @@ class Specification(Generic[D]):
         Retrieve the anchors contained in the given document.
         """
         return self._anchors_in(self, contents)
+
+    def references_in(self, contents: D) -> Iterable[Reference]:
+        """
+        Enumerate the references contained directly in the given document.
+
+        Only references at the top level of the document are returned;
+        references within subresources are found by recursively calling
+        `subresources_of` and this method. As enumeration follows the
+        specification's notion of where subresources live, the same key
+        appearing within non-schema data is not mistaken for a reference.
+        """
+        return self._references_in(self, contents)
 
     def create_resource(self, contents: D) -> Resource[D]:
         """

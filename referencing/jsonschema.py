@@ -10,6 +10,8 @@ from typing import Any
 from referencing import Anchor, Registry, Resource, Specification, exceptions
 from referencing._attrs import frozen
 from referencing._core import (
+    Reference,
+    ReferenceKind,
     _UNSET,  # type: ignore[reportPrivateUsage]
     Resolved as _Resolved,
     Resolver as _Resolver,
@@ -134,6 +136,53 @@ def _legacy_anchor_in_id(
             resource=specification.create_resource(contents),
         ),
     ]
+
+
+def _references(
+    specification: Specification[Schema],
+    contents: Schema,
+    *dynamic_keywords: str,
+) -> Iterable[Reference]:
+    """
+    Enumerate references from the given reference-bearing keywords.
+
+    Any keyword listed in ``dynamic_keywords`` produces a dynamic reference;
+    a ``$ref`` keyword (if present) produces a normal static reference.
+
+    This is only invoked on actual schema objects (never on non-schema
+    data), so a same-named key in e.g. an ``enum`` value or a property name
+    is never enumerated.
+    """
+    if isinstance(contents, bool):
+        return
+    ref = contents.get("$ref")
+    if ref is not None:
+        yield Reference(kind=ReferenceKind.STATIC, target=ref)
+    for keyword in dynamic_keywords:
+        target = contents.get(keyword)
+        if target is not None:
+            yield Reference(kind=ReferenceKind.DYNAMIC, target=target)
+
+
+def _modern_references(
+    specification: Specification[Schema],
+    contents: Schema,
+) -> Iterable[Reference]:
+    return _references(specification, contents, "$dynamicRef")
+
+
+def _recursive_references(
+    specification: Specification[Schema],
+    contents: Schema,
+) -> Iterable[Reference]:
+    return _references(specification, contents, "$recursiveRef")
+
+
+def _plain_references(
+    specification: Specification[Schema],
+    contents: Schema,
+) -> Iterable[Reference]:
+    return _references(specification, contents)
 
 
 def _subresources_of(
@@ -384,6 +433,7 @@ DRAFT202012 = Specification(
         },
     ),
     anchors_in=_anchor,
+    references_in=_modern_references,
     maybe_in_subresource=_maybe_in_subresource(
         in_value={
             "additionalProperties",
@@ -436,6 +486,7 @@ DRAFT201909 = Specification(
         },
     ),
     anchors_in=_anchor_2019,
+    references_in=_recursive_references,
     maybe_in_subresource=_maybe_in_subresource_crazy_items(
         in_value={
             "additionalItems",
@@ -479,6 +530,7 @@ DRAFT7 = Specification(
         in_subvalues={"definitions", "patternProperties", "properties"},
     ),
     anchors_in=_legacy_anchor_in_dollar_id,
+    references_in=_plain_references,
     maybe_in_subresource=_maybe_in_subresource_crazy_items_dependencies(
         in_value={
             "additionalItems",
@@ -510,6 +562,7 @@ DRAFT6 = Specification(
         in_subvalues={"definitions", "patternProperties", "properties"},
     ),
     anchors_in=_legacy_anchor_in_dollar_id,
+    references_in=_plain_references,
     maybe_in_subresource=_maybe_in_subresource_crazy_items_dependencies(
         in_value={
             "additionalItems",
@@ -532,6 +585,7 @@ DRAFT4 = Specification(
         in_subvalues={"definitions", "patternProperties", "properties"},
     ),
     anchors_in=_legacy_anchor_in_id,
+    references_in=_plain_references,
     maybe_in_subresource=_maybe_in_subresource_crazy_items_dependencies(
         in_value={"additionalItems", "additionalProperties", "not"},
         in_subarray={"allOf", "anyOf", "oneOf"},
@@ -547,6 +601,7 @@ DRAFT3 = Specification(
         in_subvalues={"definitions", "patternProperties", "properties"},
     ),
     anchors_in=_legacy_anchor_in_id,
+    references_in=_plain_references,
     maybe_in_subresource=_maybe_in_subresource_crazy_items_dependencies(
         in_value={"additionalItems", "additionalProperties"},
         in_subarray={"extends"},
@@ -589,6 +644,41 @@ def specification_with(
         return resource.contents
     if default is _UNSET:
         raise UnknownDialect(dialect_id)
+    return default
+
+
+_SPECIFICATIONS_BY_NAME: dict[str, Specification[Schema]] = {
+    specification.name: specification
+    for dialect_id, specification in (
+        ("https://json-schema.org/draft/2020-12/schema", DRAFT202012),
+        ("https://json-schema.org/draft/2019-09/schema", DRAFT201909),
+        ("http://json-schema.org/draft-07/schema", DRAFT7),
+        ("http://json-schema.org/draft-06/schema", DRAFT6),
+        ("http://json-schema.org/draft-04/schema", DRAFT4),
+        ("http://json-schema.org/draft-03/schema", DRAFT3),
+    )
+}
+
+
+def specification_named(
+    name: str,
+    default: Specification[Any] | _Unset = _UNSET,
+) -> Specification[Any]:
+    """
+    Retrieve a built-in `Specification` by its short name.
+
+    Raises:
+
+        `UnknownDialect`
+
+            if no built-in specification has the given name
+
+    """
+    resource = _SPECIFICATIONS_BY_NAME.get(name)
+    if resource is not None:
+        return resource
+    if default is _UNSET:
+        raise UnknownDialect(name)
     return default
 
 
