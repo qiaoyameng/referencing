@@ -163,3 +163,22 @@ class InvalidAnchor(Unresolvable):
             f"to use '#/{self.anchor}', as the slash is required *before each "
             "segment* of a JSON pointer."
         )
+
+
+@frozen
+class DigestMismatch(Exception):
+    """
+    A resource's contents do not match the digest recorded for them.
+
+    E.g. a `referencing.Bundle` was modified after it was packed.
+    """
+
+    uri: URI
+
+    def __eq__(self, other: object) -> bool:
+        if self.__class__ is not other.__class__:
+            return NotImplemented
+        return attrs.astuple(self) == attrs.astuple(other)
+
+    def __hash__(self) -> int:
+        return hash(attrs.astuple(self))

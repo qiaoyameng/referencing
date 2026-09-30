@@ -6,8 +6,17 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence, Set
 from typing import Any
+from urllib.parse import urljoin
 
-from referencing import Anchor, Registry, Resource, Specification, exceptions
+from referencing import (
+    Anchor,
+    Reference,
+    ReferenceKind,
+    Registry,
+    Resource,
+    Specification,
+    exceptions,
+)
 from referencing._attrs import frozen
 from referencing._core import (
     _UNSET,  # type: ignore[reportPrivateUsage]
@@ -134,6 +143,35 @@ def _legacy_anchor_in_id(
             resource=specification.create_resource(contents),
         ),
     ]
+
+
+def _references_in(kinds: Mapping[str, ReferenceKind]):
+    """
+    Create a callable finding references of the given keyword kinds.
+
+    Only keywords in schema position are considered -- identically-named
+    keys within non-schema data (e.g. within ``const`` or ``examples``)
+    are not references.
+    """
+
+    def references_in(
+        specification: Specification[Schema],
+        contents: Schema,
+        base_uri: URI = "",
+    ) -> Iterable[Reference]:
+        if isinstance(contents, bool):
+            return
+        id = specification.id_of(contents)
+        if id is not None:
+            base_uri = urljoin(base_uri, id)
+        for keyword, kind in kinds.items():
+            ref = contents.get(keyword)
+            if isinstance(ref, str):
+                yield Reference(uri=urljoin(base_uri, ref), kind=kind)
+        for each in specification.subresources_of(contents):
+            yield from references_in(specification, each, base_uri)
+
+    return references_in
 
 
 def _subresources_of(
@@ -384,6 +422,12 @@ DRAFT202012 = Specification(
         },
     ),
     anchors_in=_anchor,
+    references_in=_references_in(
+        {
+            "$ref": ReferenceKind.NORMAL,
+            "$dynamicRef": ReferenceKind.DYNAMIC,
+        },
+    ),
     maybe_in_subresource=_maybe_in_subresource(
         in_value={
             "additionalProperties",
@@ -436,6 +480,12 @@ DRAFT201909 = Specification(
         },
     ),
     anchors_in=_anchor_2019,
+    references_in=_references_in(
+        {
+            "$ref": ReferenceKind.NORMAL,
+            "$recursiveRef": ReferenceKind.RECURSIVE,
+        },
+    ),
     maybe_in_subresource=_maybe_in_subresource_crazy_items(
         in_value={
             "additionalItems",
@@ -479,6 +529,7 @@ DRAFT7 = Specification(
         in_subvalues={"definitions", "patternProperties", "properties"},
     ),
     anchors_in=_legacy_anchor_in_dollar_id,
+    references_in=_references_in({"$ref": ReferenceKind.NORMAL}),
     maybe_in_subresource=_maybe_in_subresource_crazy_items_dependencies(
         in_value={
             "additionalItems",
@@ -510,6 +561,7 @@ DRAFT6 = Specification(
         in_subvalues={"definitions", "patternProperties", "properties"},
     ),
     anchors_in=_legacy_anchor_in_dollar_id,
+    references_in=_references_in({"$ref": ReferenceKind.NORMAL}),
     maybe_in_subresource=_maybe_in_subresource_crazy_items_dependencies(
         in_value={
             "additionalItems",
@@ -532,6 +584,7 @@ DRAFT4 = Specification(
         in_subvalues={"definitions", "patternProperties", "properties"},
     ),
     anchors_in=_legacy_anchor_in_id,
+    references_in=_references_in({"$ref": ReferenceKind.NORMAL}),
     maybe_in_subresource=_maybe_in_subresource_crazy_items_dependencies(
         in_value={"additionalItems", "additionalProperties", "not"},
         in_subarray={"allOf", "anyOf", "oneOf"},
@@ -547,6 +600,7 @@ DRAFT3 = Specification(
         in_subvalues={"definitions", "patternProperties", "properties"},
     ),
     anchors_in=_legacy_anchor_in_id,
+    references_in=_references_in({"$ref": ReferenceKind.NORMAL}),
     maybe_in_subresource=_maybe_in_subresource_crazy_items_dependencies(
         in_value={"additionalItems", "additionalProperties"},
         in_subarray={"extends"},

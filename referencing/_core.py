@@ -36,6 +36,35 @@ class _MaybeInSubresource(Protocol[D]):
     ) -> Resolver[D]: ...
 
 
+class ReferenceKind(Enum):
+    """
+    The kind of a `Reference` found within a resource.
+    """
+
+    #: A normal reference (e.g. JSON Schema's ``$ref``).
+    NORMAL = "normal"
+
+    #: A dynamic reference (e.g. JSON Schema 2020's ``$dynamicRef``).
+    DYNAMIC = "dynamic"
+
+    #: A recursive reference (e.g. JSON Schema 2019's ``$recursiveRef``).
+    RECURSIVE = "recursive"
+
+
+@frozen
+class Reference:
+    """
+    A reference from within a resource to (possibly) another resource.
+    """
+
+    #: The URI of the reference, resolved against any IDs which appear
+    #: between it and the root of the resource containing it.
+    uri: URI
+
+    #: What kind of reference this is.
+    kind: ReferenceKind = ReferenceKind.NORMAL
+
+
 def _detect_or_error(contents: D) -> Specification[D]:
     if not isinstance(contents, Mapping):
         raise exceptions.CannotDetermineSpecification(contents)
@@ -111,6 +140,15 @@ class Specification(Generic[D]):
         Iterable[AnchorType[D]],
     ] = field(alias="anchors_in")
 
+    #: Retrieve the references (to other resources) in the given document.
+    _references_in: Callable[
+        [Specification[D], D],
+        Iterable[Reference],
+    ] = field(
+        default=lambda specification, contents: [],
+        alias="references_in",
+    )
+
     #: An opaque specification where resources have no subresources
     #: nor internal identifiers.
     OPAQUE: ClassVar[Specification[Any]]
@@ -156,6 +194,12 @@ class Specification(Generic[D]):
         Retrieve the anchors contained in the given document.
         """
         return self._anchors_in(self, contents)
+
+    def references_in(self, contents: D) -> Iterable[Reference]:
+        """
+        Retrieve the references to other resources within the given contents.
+        """
+        return self._references_in(self, contents)
 
     def create_resource(self, contents: D) -> Resource[D]:
         """
@@ -245,6 +289,12 @@ class Resource(Generic[D]):
         Retrieve this resource's (specification-specific) anchors.
         """
         return self._specification.anchors_in(self.contents)
+
+    def references(self) -> Iterable[Reference]:
+        """
+        Retrieve this resource's references to (possibly) other resources.
+        """
+        return self._specification.references_in(self.contents)
 
     def pointer(self, pointer: str, resolver: Resolver[D]) -> Resolved[D]:
         """

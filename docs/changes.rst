@@ -2,6 +2,13 @@
 Changelog
 =========
 
+v0.38.0
+-------
+
+* Add ``referencing.pack``, which packs a root resource along with everything it (transitively) references into a ``referencing.Bundle`` suitable for use in offline environments.
+  ``Bundle.load`` verifies the bundle against its manifest (which records content digests as well as any resources which could not be found) and builds a ``Registry`` which performs no further external retrieval.
+  ``Specification`` objects can now enumerate the references within a document via the new ``Specification.references_in`` (and ``Resource.references``), distinguishing e.g. normal references from dynamic ones.
+
 v0.37.0
 -------
 
