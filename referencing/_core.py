@@ -16,6 +16,110 @@ EMPTY_UNCRAWLED: HashTrieSet[URI] = HashTrieSet()
 EMPTY_PREVIOUS_RESOLVERS: List[URI] = List()
 
 
+@frozen
+class TraceEvent:
+    """
+    A single event recorded within a `ResolutionTrace`.
+
+    The ``kind`` of an event describes which step of resolution it
+    corresponds to, and ``details`` contains kind-specific information.
+    See `ResolutionTrace` for the kinds of events which are recorded.
+    """
+
+    kind: str
+    details: dict[str, Any] = field(factory=dict)
+
+
+class ResolutionTrace:
+    """
+    A record of the steps taken while resolving a single reference.
+
+    Pass an instance to `Resolver.lookup` via its ``trace`` argument and it
+    will be populated as that specific lookup proceeds. The recorded
+    information is collected during the lookup itself -- producing the
+    trace never performs additional retrieval or re-resolution.
+
+    Lookups performed with resolvers returned from a traced lookup are
+    themselves recorded as children of this trace (see `children`), so the
+    traces of nested lookups remain associated with their parent.
+
+    Instances have the following attributes:
+
+    .. list-table::
+
+        * - ``ref``
+          - the reference passed to `Resolver.lookup`
+        * - ``base_uri``
+          - the base URI the reference was resolved against
+        * - ``events``
+          - the `TraceEvent`\\ s recorded, in order
+        * - ``children``
+          - traces of nested lookups, in the order they occurred
+        * - ``error``
+          - the exception which ended resolution, if the lookup failed
+
+    The ``kind`` of each recorded event is one of:
+
+    .. list-table::
+
+        * - ``resource``
+          - resolution switched to the resource identified by
+            ``details["uri"]`` (either the lookup target or a subresource
+            entered while following a JSON pointer)
+        * - ``pointer-step``
+          - the JSON pointer segment ``details["segment"]`` was followed
+        * - ``anchor``
+          - the plain-name anchor ``details["name"]`` was found within the
+            resource identified by ``details["uri"]``
+        * - ``anchor-candidate``
+          - a dynamic anchor named ``details["name"]`` was found in the
+            dynamic scope at ``details["uri"]``
+        * - ``adopted``
+          - the anchor ``details["anchor"]`` was the final one adopted;
+            ``details["uri"]`` is the dynamic scope URI it came from, or
+            `None` if the statically resolved anchor was kept
+        * - ``error``
+          - resolution failed at this step; ``details["error"]`` is the
+            exception, and it is the last event recorded for this lookup
+    """
+
+    __slots__ = ("base_uri", "children", "error", "events", "ref")
+
+    def __init__(self) -> None:
+        self.ref: URI | None = None
+        self.base_uri: URI | None = None
+        self.events: list[TraceEvent] = []
+        self.children: list[ResolutionTrace] = []
+        self.error: Exception | None = None
+
+    def __repr__(self) -> str:
+        return (
+            f"<ResolutionTrace ref={self.ref!r} "
+            f"events={len(self.events)} children={len(self.children)}>"
+        )
+
+    def record(self, kind: str, **details: Any) -> None:
+        """
+        Append an event of the given kind to the trace.
+        """
+        self.events.append(TraceEvent(kind=kind, details=details))
+
+    def fail(self, error: Exception, **details: Any) -> None:
+        """
+        Record that resolution failed with the given exception.
+        """
+        self.error = error
+        self.record("error", error=error, **details)
+
+    def child(self) -> ResolutionTrace:
+        """
+        Create (and link) a trace for a nested lookup.
+        """
+        child = ResolutionTrace()
+        self.children.append(child)
+        return child
+
+
 class _Unset(Enum):
     """
     What sillyness...
@@ -258,10 +362,15 @@ class Resource(Generic[D]):
 
         """
         if not pointer:
-            return Resolved(contents=self.contents, resolver=resolver)
+            return Resolved(
+                contents=self.contents,
+                resolver=resolver,
+                trace=resolver._trace,
+            )
 
         contents = self.contents
         segments: list[int | str] = []
+        trace = resolver._trace
         for segment in unquote(pointer[1:]).split("/"):
             if isinstance(contents, Sequence):
                 segment = int(segment)
@@ -271,9 +380,13 @@ class Resource(Generic[D]):
                 contents = contents[segment]  # type: ignore[reportUnknownArgumentType]
             except LookupError as lookup_error:
                 error = exceptions.PointerToNowhere(ref=pointer, resource=self)
+                if trace is not None:
+                    trace.fail(error, segment=segment)
                 raise error from lookup_error
 
             segments.append(segment)
+            if trace is not None:
+                trace.record("pointer-step", segment=segment)
             last = resolver
             resolver = self._specification.maybe_in_subresource(
                 segments=segments,
@@ -281,8 +394,10 @@ class Resource(Generic[D]):
                 subresource=self._specification.create_resource(contents),
             )
             if resolver is not last:
+                if trace is not None:
+                    trace.record("resource", uri=resolver._base_uri)
                 segments = []
-        return Resolved(contents=contents, resolver=resolver)  # type: ignore[reportUnknownArgumentType]
+        return Resolved(contents=contents, resolver=resolver, trace=trace)  # type: ignore[reportUnknownArgumentType]
 
 
 def _fail_to_retrieve(uri: URI):
@@ -616,6 +731,7 @@ class Resolved(Generic[D]):
 
     contents: D
     resolver: Resolver[D]
+    trace: ResolutionTrace | None = None
 
 
 @frozen
@@ -644,10 +760,27 @@ class Resolver(Generic[D]):
     _base_uri: URI = field(alias="base_uri")
     _registry: Registry[D] = field(alias="registry")
     _previous: List[URI] = field(default=List(), repr=False, alias="previous")
+    _trace: ResolutionTrace | None = field(
+        default=None,
+        repr=False,
+        alias="trace",
+    )
 
-    def lookup(self, ref: URI) -> Resolved[D]:
+    def lookup(
+        self,
+        ref: URI,
+        *,
+        trace: ResolutionTrace | None = None,
+    ) -> Resolved[D]:
         """
         Resolve the given reference to the resource it points to.
+
+        If a `ResolutionTrace` is passed via ``trace``, it is populated
+        with the steps taken during *this* lookup, as they happen --
+        producing the trace performs no additional retrieval or
+        re-resolution. If the lookup fails, the trace's events stop at the
+        step which failed. Lookups performed with resolvers returned from
+        a traced lookup are recorded as children of the trace.
 
         Raises:
 
@@ -669,28 +802,64 @@ class Resolver(Generic[D]):
                 that does not exist
 
         """
+        if trace is None and self._trace is not None:
+            trace = self._trace.child()
+        if trace is not None:
+            trace.ref = ref
+            trace.base_uri = self._base_uri
+
         if ref.startswith("#"):
             uri, fragment = self._base_uri, ref[1:]
         else:
             uri, fragment = urldefrag(urljoin(self._base_uri, ref))
         try:
             retrieved = self._registry.get_or_retrieve(uri)
-        except exceptions.NoSuchResource:
+        except exceptions.NoSuchResource as error:
+            if trace is not None:
+                trace.fail(error, uri=uri)
             raise exceptions.Unresolvable(ref=ref) from None
         except exceptions.Unretrievable as error:
+            if trace is not None:
+                trace.fail(error, uri=uri)
             raise exceptions.Unresolvable(ref=ref) from error
 
+        if trace is not None:
+            trace.record("resource", uri=uri)
+
         if fragment.startswith("/"):
-            resolver = self._evolve(registry=retrieved.registry, base_uri=uri)
+            resolver = self._evolve(
+                registry=retrieved.registry,
+                base_uri=uri,
+                trace=trace,
+            )
             return retrieved.value.pointer(pointer=fragment, resolver=resolver)
 
         if fragment:
-            retrieved = retrieved.registry.anchor(uri, fragment)
-            resolver = self._evolve(registry=retrieved.registry, base_uri=uri)
+            try:
+                retrieved = retrieved.registry.anchor(uri, fragment)
+            except (exceptions.Unresolvable, exceptions.NoSuchResource) as e:
+                if trace is not None:
+                    trace.fail(e, uri=uri, anchor=fragment)
+                raise
+            if trace is not None:
+                trace.record("anchor", uri=uri, name=fragment)
+            resolver = self._evolve(
+                registry=retrieved.registry,
+                base_uri=uri,
+                trace=trace,
+            )
             return retrieved.value.resolve(resolver=resolver)
 
-        resolver = self._evolve(registry=retrieved.registry, base_uri=uri)
-        return Resolved(contents=retrieved.value.contents, resolver=resolver)
+        resolver = self._evolve(
+            registry=retrieved.registry,
+            base_uri=uri,
+            trace=trace,
+        )
+        return Resolved(
+            contents=retrieved.value.contents,
+            resolver=resolver,
+            trace=trace,
+        )
 
     def in_subresource(self, subresource: Resource[D]) -> Resolver[D]:
         """
@@ -731,4 +900,11 @@ class Anchor(Generic[D]):
         """
         Return the resource for this anchor.
         """
-        return Resolved(contents=self.resource.contents, resolver=resolver)
+        trace = resolver._trace
+        if trace is not None:
+            trace.record("adopted", anchor=self.name)
+        return Resolved(
+            contents=self.resource.contents,
+            resolver=resolver,
+            trace=trace,
+        )

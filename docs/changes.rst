@@ -2,6 +2,17 @@
 Changelog
 =========
 
+v0.38.0
+-------
+
+* Add optional resolution tracing via ``referencing.ResolutionTrace``.
+  Passing a trace to ``Resolver.lookup`` records the steps of that lookup
+  (input reference, base URI, resource switches, JSON pointer steps,
+  candidate anchors and the adopted result) as they happen, without any
+  additional retrieval or re-resolution; nested lookups are linked as
+  children of the parent trace, and failed lookups record the step at
+  which they failed.
+
 v0.37.0
 -------
 

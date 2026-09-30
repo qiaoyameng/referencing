@@ -1,7 +1,14 @@
 from rpds import HashTrieMap
 import pytest
 
-from referencing import Anchor, Registry, Resource, Specification, exceptions
+from referencing import (
+    Anchor,
+    Registry,
+    ResolutionTrace,
+    Resource,
+    Specification,
+    exceptions,
+)
 from referencing.jsonschema import DRAFT202012
 
 ID_AND_CHILDREN = Specification(
@@ -958,6 +965,166 @@ class TestResolver:
             ("http://example.com/", second.resolver._registry),
         ]
         assert list(first.resolver.dynamic_scope()) == []
+
+
+class TestResolutionTrace:
+    def test_disabled_by_default(self):
+        resource = Resource.opaque(contents={"foo": "baz"})
+        resolver = Registry({"http://example.com/1": resource}).resolver()
+        resolved = resolver.lookup("http://example.com/1")
+        assert resolved.trace is None
+        assert resolved.resolver._trace is None
+
+    def test_records_ref_base_uri_and_resource(self):
+        resource = Resource.opaque(contents={"foo": "baz"})
+        resolver = Registry({"http://example.com/1": resource}).resolver()
+        trace = ResolutionTrace()
+        resolved = resolver.lookup("http://example.com/1", trace=trace)
+        assert resolved.trace is trace
+        assert trace.ref == "http://example.com/1"
+        assert trace.base_uri == ""
+        assert trace.error is None
+        assert [(e.kind, e.details) for e in trace.events] == [
+            ("resource", {"uri": "http://example.com/1"}),
+        ]
+
+    def test_records_pointer_steps_and_resource_switches(self):
+        root = ID_AND_CHILDREN.create_resource(
+            {
+                "ID": "http://example.com/",
+                "children": [
+                    {"ID": "child/", "children": [{"ID": "grandchild"}]},
+                ],
+            },
+        )
+        resolver = (root @ Registry()).resolver()
+        trace = ResolutionTrace()
+        resolved = resolver.lookup(
+            "http://example.com/#/children/0/children/0",
+            trace=trace,
+        )
+        assert resolved.contents == {"ID": "grandchild"}
+        assert [(e.kind, e.details) for e in trace.events] == [
+            ("resource", {"uri": "http://example.com/"}),
+            ("pointer-step", {"segment": "children"}),
+            ("pointer-step", {"segment": 0}),
+            ("resource", {"uri": "http://example.com/child/"}),
+            ("pointer-step", {"segment": "children"}),
+            ("pointer-step", {"segment": 0}),
+            ("resource", {"uri": "http://example.com/child/grandchild"}),
+        ]
+
+    def test_records_anchor_resolution(self):
+        root = ID_AND_CHILDREN.create_resource({"anchors": {"foo": 12}})
+        resolver = Registry().with_resource("urn:example", root).resolver()
+        trace = ResolutionTrace()
+        resolved = resolver.lookup("urn:example#foo", trace=trace)
+        assert resolved.contents == 12
+        assert [(e.kind, e.details) for e in trace.events] == [
+            ("resource", {"uri": "urn:example"}),
+            ("anchor", {"uri": "urn:example", "name": "foo"}),
+            ("adopted", {"anchor": "foo"}),
+        ]
+
+    def test_nested_lookups_are_linked_as_children(self):
+        root = ID_AND_CHILDREN.create_resource(
+            {
+                "ID": "http://example.com/",
+                "anchors": {"foo": 12},
+            },
+        )
+        resolver = (root @ Registry()).resolver()
+        trace = ResolutionTrace()
+        first = resolver.lookup("http://example.com/", trace=trace)
+        second = first.resolver.lookup("#foo")
+        assert second.contents == 12
+
+        assert len(trace.children) == 1
+        child = trace.children[0]
+        assert child.ref == "#foo"
+        assert child.base_uri == "http://example.com/"
+        assert [e.kind for e in child.events] == [
+            "resource",
+            "anchor",
+            "adopted",
+        ]
+
+    def test_tracing_does_not_retrieve_again(self):
+        """
+        The trace is populated by the lookup itself, without performing
+        any additional retrieval to explain the result.
+        """
+        resource = Resource.opaque(contents={"foo": "baz"})
+        calls = []
+
+        def retrieve(uri):
+            calls.append(uri)
+            return resource
+
+        resolver = Registry(retrieve=retrieve).resolver()
+        trace = ResolutionTrace()
+        resolved = resolver.lookup("http://example.com/", trace=trace)
+        assert resolved.contents == resource.contents
+        assert calls == ["http://example.com/"]
+        assert [e.kind for e in trace.events] == ["resource"]
+
+        # And a traced lookup compares identically to an untraced one.
+        calls.clear()
+        resolver.lookup("http://example.com/elsewhere")
+        assert calls == ["http://example.com/elsewhere"]
+
+    def test_error_stops_at_the_failing_pointer_segment(self):
+        resource = Resource.opaque({"foo": {"bar": 1}})
+        resolver = Registry({"http://example.com/1": resource}).resolver()
+        trace = ResolutionTrace()
+        with pytest.raises(exceptions.PointerToNowhere) as e:
+            resolver.lookup("http://example.com/1#/foo/baz/quux", trace=trace)
+        assert trace.error is e.value
+        assert [(e.kind, e.details) for e in trace.events] == [
+            ("resource", {"uri": "http://example.com/1"}),
+            ("pointer-step", {"segment": "foo"}),
+            ("error", {"error": e.value, "segment": "baz"}),
+        ]
+
+    def test_error_stops_at_failed_retrieval(self):
+        calls = []
+
+        def retrieve(uri):
+            calls.append(uri)
+            raise exceptions.NoSuchResource(ref=uri)
+
+        resolver = Registry(retrieve=retrieve).resolver()
+        trace = ResolutionTrace()
+        with pytest.raises(exceptions.Unresolvable):
+            resolver.lookup("http://example.com/", trace=trace)
+        assert calls == ["http://example.com/"]
+        assert isinstance(trace.error, exceptions.NoSuchResource)
+        assert [(e.kind, e.details["uri"]) for e in trace.events] == [
+            ("error", "http://example.com/"),
+        ]
+
+    def test_error_stops_at_missing_anchor(self):
+        root = ID_AND_CHILDREN.create_resource({"anchors": {}})
+        resolver = Registry().with_resource("urn:example", root).resolver()
+        trace = ResolutionTrace()
+        with pytest.raises(exceptions.NoSuchAnchor) as e:
+            resolver.lookup("urn:example#noSuchAnchor", trace=trace)
+        assert trace.error is e.value
+        assert [(e.kind, e.details) for e in trace.events] == [
+            ("resource", {"uri": "urn:example"}),
+            (
+                "error",
+                {
+                    "error": e.value,
+                    "uri": "urn:example",
+                    "anchor": "noSuchAnchor",
+                },
+            ),
+        ]
+
+    def test_repr(self):
+        trace = ResolutionTrace()
+        assert repr(trace) == "<ResolutionTrace ref=None events=0 children=0>"
 
 
 class TestSpecification:

@@ -1,6 +1,11 @@
 import pytest
 
-from referencing import Registry, Resource, Specification
+from referencing import (
+    Registry,
+    ResolutionTrace,
+    Resource,
+    Specification,
+)
 import referencing.jsonschema
 
 
@@ -270,6 +275,82 @@ def test_multiple_lookup_dynamic_ref_to_nondynamic_ref():
     resolver = second.resolver.lookup("bar").resolver
     fourth = resolver.lookup("#fooAnchor")
     assert fourth.contents == two.contents
+
+
+def test_traced_lookup_of_two_level_dynamic_ref():
+    """
+    A traced dynamic reference lookup records the candidate anchors found
+    while walking the dynamic scope, as well as the one finally adopted --
+    all collected during the lookup itself, without extra retrieval.
+    """
+    root = referencing.jsonschema.DRAFT202012.create_resource(
+        {
+            "$id": "http://example.com/",
+            "$dynamicAnchor": "fooAnchor",
+            "$defs": {
+                "foo": {
+                    "$id": "foo/",
+                    "$dynamicAnchor": "fooAnchor",
+                    "$defs": {
+                        "bar": {
+                            "$id": "bar",
+                            "$dynamicAnchor": "fooAnchor",
+                        },
+                    },
+                },
+            },
+        },
+    )
+    calls = []
+
+    def retrieve(uri):
+        calls.append(uri)
+        if uri == "http://example.com/":
+            return root
+        raise referencing.exceptions.NoSuchResource(ref=uri)
+
+    resolver = Registry(retrieve=retrieve).resolver()
+
+    trace = ResolutionTrace()
+    first = resolver.lookup("http://example.com/", trace=trace)
+    second = first.resolver.lookup("foo/")
+    third = second.resolver.lookup("bar")
+    fourth = third.resolver.lookup("#fooAnchor")
+    assert fourth.contents == root.contents
+
+    # The trace came from the lookups themselves: the only retrieval was
+    # the one the first lookup needed anyway.
+    assert calls == ["http://example.com/"]
+
+    # Each nested lookup is linked as a child of the previous trace.
+    [second_trace] = trace.children
+    assert second_trace.ref == "foo/"
+    [third_trace] = second_trace.children
+    assert third_trace.ref == "bar"
+    [fourth_trace] = third_trace.children
+    assert fourth_trace.ref == "#fooAnchor"
+    assert fourth_trace.base_uri == "http://example.com/foo/bar"
+
+    # The innermost dynamic anchor was resolved statically, then the walk
+    # of the dynamic scope found the two outer candidates, and the
+    # outermost one was adopted.
+    assert [(e.kind, e.details) for e in fourth_trace.events] == [
+        ("resource", {"uri": "http://example.com/foo/bar"}),
+        (
+            "anchor",
+            {"uri": "http://example.com/foo/bar", "name": "fooAnchor"},
+        ),
+        (
+            "anchor-candidate",
+            {"uri": "http://example.com/foo/", "name": "fooAnchor"},
+        ),
+        (
+            "anchor-candidate",
+            {"uri": "http://example.com/", "name": "fooAnchor"},
+        ),
+        ("adopted", {"anchor": "fooAnchor", "uri": "http://example.com/"}),
+    ]
+    assert fourth.trace is fourth_trace
 
 
 def test_lookup_trivial_recursive_ref():

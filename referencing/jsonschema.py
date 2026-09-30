@@ -606,6 +606,8 @@ class DynamicAnchor:
         Resolve this anchor dynamically.
         """
         last = self.resource
+        last_uri = None
+        trace = resolver._trace  # type: ignore[reportPrivateUsage]
         for uri, registry in resolver.dynamic_scope():
             try:
                 anchor = registry.anchor(uri, self.name).value
@@ -613,9 +615,15 @@ class DynamicAnchor:
                 continue
             if isinstance(anchor, DynamicAnchor):
                 last = anchor.resource
+                last_uri = uri
+                if trace is not None:
+                    trace.record("anchor-candidate", uri=uri, name=self.name)
+        if trace is not None:
+            trace.record("adopted", anchor=self.name, uri=last_uri)
         return _Resolved(
             contents=last.contents,
             resolver=resolver.in_subresource(last),
+            trace=trace,
         )
 
 
