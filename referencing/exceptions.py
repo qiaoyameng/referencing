@@ -12,7 +12,34 @@ from referencing._attrs import frozen
 
 if TYPE_CHECKING:
     from referencing import Resource
+    from referencing.trace import ResolutionTrace
     from referencing.typing import URI
+
+
+def _identity_tuple(exception: Exception) -> tuple:
+    """
+    Return the identifying fields of an exception, ignoring any trace.
+    """
+    return attrs.astuple(
+        exception,
+        filter=lambda attribute, value: attribute.eq,
+    )
+
+
+def _hashable_identity(exception: Exception) -> tuple:
+    """
+    Return identifying fields suitable for hashing.
+
+    Some fields (like the full resource document) may themselves be
+    unhashable, so they are excluded here while remaining part of equality.
+    """
+    return attrs.astuple(
+        exception,
+        filter=lambda attribute, value: (
+            attribute.eq
+            and attribute.name not in {"resource", "contents"}
+        ),
+    )
 
 
 @frozen
@@ -101,14 +128,27 @@ class Unresolvable(Exception):
     """
 
     ref: URI
+    _trace: ResolutionTrace | None = attrs.field(
+        default=None,
+        eq=False,
+        kw_only=True,
+        alias="trace",
+    )
+
+    @property
+    def trace(self) -> ResolutionTrace | None:
+        """
+        The `referencing.trace.ResolutionTrace` for the failed lookup, if any.
+        """
+        return self._trace
 
     def __eq__(self, other: object) -> bool:
         if self.__class__ is not other.__class__:
             return NotImplemented
-        return attrs.astuple(self) == attrs.astuple(other)
+        return _identity_tuple(self) == _identity_tuple(other)
 
     def __hash__(self) -> int:
-        return hash(attrs.astuple(self))
+        return hash(_hashable_identity(self))
 
 
 @frozen

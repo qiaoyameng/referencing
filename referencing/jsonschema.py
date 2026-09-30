@@ -15,6 +15,7 @@ from referencing._core import (
     Resolver as _Resolver,
     _Unset,  # type: ignore[reportPrivateUsage]
 )
+from referencing.trace import NULL_TRACE  # type: ignore[reportPrivateUsage]
 from referencing.typing import URI, Anchor as AnchorType, Mapping
 
 #: A JSON Schema which is a JSON object
@@ -601,21 +602,54 @@ class DynamicAnchor:
     name: str
     resource: SchemaResource
 
+    _referencing_dynamic_anchor = True
+
     def resolve(self, resolver: _Resolver[Schema]) -> _Resolved[Schema]:
         """
         Resolve this anchor dynamically.
         """
         last = self.resource
+        initial_uri = resolver._base_uri
+        adopted_uri = initial_uri
+        adopted_dynamic = False
+        recorder = resolver.recorder
+        trace = recorder if recorder is not None else NULL_TRACE
+        trace.anchor_candidate(
+            uri=initial_uri,
+            name=self.name,
+            found=True,
+            dynamic=True,
+        )
         for uri, registry in resolver.dynamic_scope():
             try:
                 anchor = registry.anchor(uri, self.name).value
             except exceptions.NoSuchAnchor:
+                trace.anchor_candidate(
+                    uri=uri,
+                    name=self.name,
+                    found=False,
+                    dynamic=False,
+                )
                 continue
+            trace.anchor_candidate(
+                uri=uri,
+                name=self.name,
+                found=True,
+                dynamic=isinstance(anchor, DynamicAnchor),
+            )
             if isinstance(anchor, DynamicAnchor):
                 last = anchor.resource
+                adopted_uri = uri
+                adopted_dynamic = True
+        trace.anchor_adopted(
+            uri=adopted_uri,
+            name=self.name,
+            dynamic=adopted_dynamic,
+        )
         return _Resolved(
             contents=last.contents,
             resolver=resolver.in_subresource(last),
+            trace=recorder,
         )
 
 

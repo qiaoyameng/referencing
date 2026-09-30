@@ -2,6 +2,14 @@
 Changelog
 =========
 
+Development
+-----------
+
+* Add optional resolution tracing for ``Resolver.lookup``.
+  Call ``Resolver.traced()`` to receive a resolver which records a `referencing.trace.ResolutionTrace` of every lookup (including nested lookups triggered during resolution), containing the input reference, base URI, resource switches, JSON Pointer steps, anchor candidates (including dynamic-anchor scope walks and the adopted anchor), and the point of failure.
+  The trace is returned on successful ``Resolved`` results and attached to any raised ``Unresolvable`` exception (as ``exception.trace``).
+  Tracing records only what the lookup itself does -- it never performs additional retrievals or re-resolves references -- and untraced resolution has its previous behavior.
+
 v0.37.0
 -------
 

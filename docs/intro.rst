@@ -267,3 +267,41 @@ The above example would be written:
     print(resolver.lookup("https://json-schema.org/draft/2020-12/schema"))
 
 It is otherwise functionally equivalent to the above, other than that retrieval will not repeatedly make a web request.
+
+
+Tracing Resolution
+------------------
+
+When a reference (particularly a :kw:`$dynamicRef`) resolves to something different than expected, it can be useful to see *how* it was resolved: which base URI it was combined with, which resources were switched between, which anchors were considered (and ultimately adopted), and where resolution failed if it did.
+
+Call `~referencing._core.Resolver.traced` on a resolver to enable recording for all subsequent lookups.
+It returns a new resolver along with a `referencing.trace.ResolutionTrace`, whose events describe exactly what happened during the lookup, without performing any extra retrieval or re-resolving:
+
+.. code:: python
+
+    from referencing import Registry
+    from referencing import jsonschema
+
+    resource = jsonschema.DRAFT202012.create_resource(
+        {"$id": "https://example.com/schema", "type": "integer"},
+    )
+    registry = Registry().with_resource("https://example.com/schema", resource)
+
+    resolver, trace = registry.resolver().traced()
+    resolved = resolver.lookup("https://example.com/schema")
+    print(trace.events)
+
+The trace is also available as ``resolved.trace``, and when a lookup fails it is attached to the resulting exception:
+
+.. code:: python
+
+    from referencing import exceptions
+
+    try:
+        resolver.lookup("https://example.com/schema#/missing")
+    except exceptions.Unresolvable as error:
+        print(error.trace.events)  # ends with a LookupFailed event
+
+Each event carries a ``lookup_id`` (and ``parent_lookup_id`` for lookups triggered *during* another lookup), so traces of nested lookups can be correlated via `referencing.trace.ResolutionTrace.for_lookup`.
+
+Resolution is otherwise unchanged, and a resolver which is not tracing has no recording overhead.

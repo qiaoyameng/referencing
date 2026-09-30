@@ -21,6 +21,9 @@ Plainly then, you may rely on their methods and attributes not changing in backw
    :members:
    :undoc-members:
 
+   Instances may carry a `referencing.trace.ResolutionTrace` (when
+   resolution was traced) accessible via their ``trace`` attribute.
+
 
 .. autoclass:: referencing._core.Retrieved
    :members:
@@ -48,6 +51,17 @@ Plainly then, you may rely on their methods and attributes not changing in backw
 
 Submodules
 ----------
+
+referencing.trace
+^^^^^^^^^^^^^^^^^
+
+Optional recording of how a reference was resolved. Enable it via
+`referencing._core.Resolver.traced`; the returned trace is also available on
+resolved values and on raised exceptions.
+
+.. automodule:: referencing.trace
+   :members:
+   :undoc-members:
 
 referencing.jsonschema
 ^^^^^^^^^^^^^^^^^^^^^^

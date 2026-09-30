@@ -10,6 +10,7 @@ from rpds import HashTrieMap, HashTrieSet, List
 
 from referencing import exceptions
 from referencing._attrs import frozen
+from referencing.trace import NULL_TRACE, ResolutionTrace
 from referencing.typing import URI, Anchor as AnchorType, D, Mapping, Retrieve
 
 EMPTY_UNCRAWLED: HashTrieSet[URI] = HashTrieSet()
@@ -246,7 +247,12 @@ class Resource(Generic[D]):
         """
         return self._specification.anchors_in(self.contents)
 
-    def pointer(self, pointer: str, resolver: Resolver[D]) -> Resolved[D]:
+    def pointer(
+        self,
+        pointer: str,
+        resolver: Resolver[D],
+        recorder: ResolutionTrace | None = None,
+    ) -> Resolved[D]:
         """
         Resolve the given JSON pointer.
 
@@ -260,28 +266,44 @@ class Resource(Generic[D]):
         if not pointer:
             return Resolved(contents=self.contents, resolver=resolver)
 
+        trace = recorder if recorder is not None else NULL_TRACE
         contents = self.contents
         segments: list[int | str] = []
+        path = ""
         for segment in unquote(pointer[1:]).split("/"):
             if isinstance(contents, Sequence):
                 segment = int(segment)
             else:
                 segment = segment.replace("~1", "/").replace("~0", "~")
+            path += "/" + str(segment)
             try:
                 contents = contents[segment]  # type: ignore[reportUnknownArgumentType]
             except LookupError as lookup_error:
+                trace.pointer_step(
+                    segment=segment,
+                    path=path,
+                    subresource=False,
+                )
                 error = exceptions.PointerToNowhere(ref=pointer, resource=self)
                 raise error from lookup_error
 
             segments.append(segment)
             last = resolver
+            subresource = self._specification.create_resource(contents)
             resolver = self._specification.maybe_in_subresource(
                 segments=segments,
                 resolver=resolver,
-                subresource=self._specification.create_resource(contents),
+                subresource=subresource,
             )
-            if resolver is not last:
+            entered = resolver is not last
+            if entered:
+                resolver = evolve(resolver, recorder=recorder)
                 segments = []
+            trace.pointer_step(
+                segment=segment,
+                path=path,
+                subresource=entered,
+            )
         return Resolved(contents=contents, resolver=resolver)  # type: ignore[reportUnknownArgumentType]
 
 
@@ -402,7 +424,11 @@ class Registry(Mapping[URI, Resource[D]]):
             summary = f"{pluralized}"
         return f"<Registry ({size} {summary})>"
 
-    def get_or_retrieve(self, uri: URI) -> Retrieved[D, Resource[D]]:
+    def get_or_retrieve(
+        self,
+        uri: URI,
+        recorder: ResolutionTrace | None = None,
+    ) -> Retrieved[D, Resource[D]]:
         """
         Get a resource from the registry, crawling or retrieving if necessary.
 
@@ -410,15 +436,19 @@ class Registry(Mapping[URI, Resource[D]]):
         so the returned object is a `Retrieved` object which contains both the
         resource value as well as the registry which ultimately contained it.
         """
+        trace = recorder if recorder is not None else NULL_TRACE
         resource = self._resources.get(uri)
         if resource is not None:
+            trace.found_in_registry(uri)
             return Retrieved(registry=self, value=resource)
 
         registry = self.crawl()
         resource = registry._resources.get(uri)
         if resource is not None:
+            trace.found_in_registry(uri)
             return Retrieved(registry=registry, value=resource)
 
+        trace.retrieval_started(uri)
         try:
             resource = registry._retrieve(uri)
         except (
@@ -429,6 +459,7 @@ class Registry(Mapping[URI, Resource[D]]):
         except Exception as error:
             raise exceptions.Unretrievable(ref=uri) from error
         else:
+            trace.retrieval_succeeded(uri)
             registry = registry.with_resource(uri, resource)
             return Retrieved(registry=registry, value=resource)
 
@@ -616,6 +647,19 @@ class Resolved(Generic[D]):
 
     contents: D
     resolver: Resolver[D]
+    _trace: ResolutionTrace | None = field(
+        default=None,
+        eq=False,
+        repr=False,
+        alias="trace",
+    )
+
+    @property
+    def trace(self) -> ResolutionTrace | None:
+        """
+        The trace recorded during this lookup, when tracing was enabled.
+        """
+        return self._trace
 
 
 @frozen
@@ -644,6 +688,37 @@ class Resolver(Generic[D]):
     _base_uri: URI = field(alias="base_uri")
     _registry: Registry[D] = field(alias="registry")
     _previous: List[URI] = field(default=List(), repr=False, alias="previous")
+    _recorder: ResolutionTrace | None = field(
+        default=None,
+        eq=False,
+        repr=False,
+        alias="recorder",
+    )
+
+    @property
+    def recorder(self) -> ResolutionTrace | None:
+        """
+        The trace this resolver records into, if tracing is enabled.
+        """
+        return self._recorder
+
+    def traced(
+        self,
+        trace: ResolutionTrace | None = None,
+    ) -> tuple[Resolver[D], ResolutionTrace]:
+        """
+        Return a resolver which records resolution traces, plus the trace.
+
+        The returned resolver behaves identically to this one, but every
+        `lookup` call on it (and any nested lookups it triggers) appends
+        events to the returned `ResolutionTrace`. The same trace is also
+        available on each resulting `Resolved` value and is attached to
+        any `exceptions.Unresolvable` raised.
+
+        Pass an existing `ResolutionTrace` to continue recording into it.
+        """
+        trace = ResolutionTrace() if trace is None else trace
+        return evolve(self, recorder=trace), trace
 
     def lookup(self, ref: URI) -> Resolved[D]:
         """
@@ -669,28 +744,85 @@ class Resolver(Generic[D]):
                 that does not exist
 
         """
-        if ref.startswith("#"):
-            uri, fragment = self._base_uri, ref[1:]
-        else:
-            uri, fragment = urldefrag(urljoin(self._base_uri, ref))
+        recorder = self._recorder
+        trace = recorder if recorder is not None else NULL_TRACE
+        lookup_id = trace.begin(ref=ref, base_uri=self._base_uri)
+
         try:
-            retrieved = self._registry.get_or_retrieve(uri)
-        except exceptions.NoSuchResource:
-            raise exceptions.Unresolvable(ref=ref) from None
-        except exceptions.Unretrievable as error:
-            raise exceptions.Unresolvable(ref=ref) from error
+            if ref.startswith("#"):
+                uri, fragment = self._base_uri, ref[1:]
+            else:
+                uri, fragment = urldefrag(urljoin(self._base_uri, ref))
+            trace.reference_resolved(uri=uri, fragment=fragment)
 
-        if fragment.startswith("/"):
-            resolver = self._evolve(registry=retrieved.registry, base_uri=uri)
-            return retrieved.value.pointer(pointer=fragment, resolver=resolver)
+            try:
+                retrieved = self._registry.get_or_retrieve(
+                    uri,
+                    recorder=recorder,
+                )
+            except exceptions.NoSuchResource:
+                raise exceptions.Unresolvable(ref=ref) from None
+            except exceptions.Unretrievable as unretrievable:
+                raise exceptions.Unresolvable(
+                    ref=ref,
+                ) from unretrievable
 
-        if fragment:
-            retrieved = retrieved.registry.anchor(uri, fragment)
-            resolver = self._evolve(registry=retrieved.registry, base_uri=uri)
-            return retrieved.value.resolve(resolver=resolver)
+            if fragment.startswith("/"):
+                resolver = self._evolve(
+                    registry=retrieved.registry,
+                    base_uri=uri,
+                )
+                resolved = retrieved.value.pointer(
+                    pointer=fragment,
+                    resolver=resolver,
+                    recorder=recorder,
+                )
+                return self._succeed(trace, resolved, recorder, uri)
 
-        resolver = self._evolve(registry=retrieved.registry, base_uri=uri)
-        return Resolved(contents=retrieved.value.contents, resolver=resolver)
+            if fragment:
+                retrieved = retrieved.registry.anchor(uri, fragment)
+                trace.anchor_found(
+                    uri=uri,
+                    name=fragment,
+                    dynamic=getattr(
+                        retrieved.value,
+                        "_referencing_dynamic_anchor",
+                        False,
+                    ),
+                )
+                resolver = self._evolve(
+                    registry=retrieved.registry,
+                    base_uri=uri,
+                )
+                resolved = retrieved.value.resolve(resolver=resolver)
+                return self._succeed(
+                    trace,
+                    resolved,
+                    recorder,
+                    resolved.resolver._base_uri,
+                )
+
+            resolver = self._evolve(
+                registry=retrieved.registry,
+                base_uri=uri,
+            )
+            resolved = Resolved(
+                contents=retrieved.value.contents,
+                resolver=resolver,
+            )
+            return self._succeed(trace, resolved, recorder, uri)
+        except exceptions.Unresolvable as error:
+            stage = self._failure_stage(error)
+            trace.failed(stage=stage, error=error)
+            if recorder is not None:
+                traced_error = evolve(error, trace=recorder)
+                if error.__cause__ is not None:
+                    raise traced_error from error.__cause__
+                raise traced_error from None
+            raise
+        except Exception as error:  # pragma: no cover
+            trace.failed(stage="unknown", error=error)
+            raise
 
     def in_subresource(self, subresource: Resource[D]) -> Resolver[D]:
         """
@@ -717,6 +849,29 @@ class Resolver(Generic[D]):
             previous = previous.push_front(self._base_uri)
         return evolve(self, base_uri=base_uri, previous=previous, **kwargs)
 
+    def _succeed(
+        self,
+        trace: Any,
+        resolved: Resolved[D],
+        recorder: ResolutionTrace | None,
+        uri: URI,
+    ) -> Resolved[D]:
+        trace.succeeded(uri=uri)
+        if recorder is None:
+            return resolved
+        return evolve(resolved, trace=recorder)
+
+    @staticmethod
+    def _failure_stage(error: exceptions.Unresolvable) -> str:
+        if isinstance(error, exceptions.PointerToNowhere):
+            return "pointer"
+        if isinstance(
+            error,
+            (exceptions.NoSuchAnchor, exceptions.InvalidAnchor),
+        ):
+            return "anchor"
+        return "retrieve"
+
 
 @frozen
 class Anchor(Generic[D]):
@@ -731,4 +886,16 @@ class Anchor(Generic[D]):
         """
         Return the resource for this anchor.
         """
+        recorder = resolver.recorder
+        if recorder is not None:
+            recorder.anchor_adopted(
+                uri=self.resource.id() or resolver._base_uri,
+                name=self.name,
+                dynamic=False,
+            )
+            return Resolved(
+                contents=self.resource.contents,
+                resolver=resolver,
+                trace=recorder,
+            )
         return Resolved(contents=self.resource.contents, resolver=resolver)
