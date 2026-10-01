@@ -4,19 +4,80 @@ Helpers related to (dynamic) resource retrieval.
 
 from __future__ import annotations
 
-from functools import lru_cache
-from typing import TYPE_CHECKING, TypeVar
 import json
+from functools import lru_cache
+from typing import TYPE_CHECKING, Generic, Protocol, TypeVar
 
 from referencing import Resource
+from referencing._attrs import frozen
+from referencing.typing import URI, D, Retrieve
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from referencing.typing import URI, D, Retrieve
-
 #: A serialized document (e.g. a JSON string)
 _T = TypeVar("_T", default=str)
+
+
+@frozen
+class RetrievalRequest(Generic[D]):
+    """
+    Context made available to a retrieval policy.
+
+    ``chain`` contains the URIs of the resources which led to this retrieval,
+    ordered from the root resource toward the resource containing the current
+    reference. ``retrieved_resources`` de-duplicates that chain, while
+    ``external_resources`` contains only resources which required retrieval.
+    ``depth`` is the depth the requested resource would have if retrieval is
+    allowed.
+    """
+
+    ref: URI
+    uri: URI
+    source: Resource[D] | None
+    chain: tuple[URI, ...]
+    retrieved_resources: tuple[URI, ...] = ()
+    external_resources: tuple[URI, ...] = ()
+    depth: int = 1
+
+
+@frozen
+class Allow:
+    """
+    Allow retrieval using the registry's configured retriever.
+    """
+
+
+@frozen
+class Deny:
+    """
+    Deny retrieval without calling any retriever.
+    """
+
+    reason: str | None = None
+
+
+@frozen
+class RetrieveWith(Generic[D]):
+    """
+    Allow retrieval, but use the given retriever rather than the default one.
+    """
+
+    retrieve: Retrieve[D]
+
+
+class RetrievalPolicy(Protocol[D]):
+    """
+    Decide whether a resource reference may be retrieved.
+    """
+
+    def __call__(
+        self,
+        request: RetrievalRequest[D],
+    ) -> Allow | Deny | RetrieveWith[D]:
+        """
+        Return an `Allow`, `Deny`, or `RetrieveWith` decision.
+        """
 
 
 def to_cached_resource(

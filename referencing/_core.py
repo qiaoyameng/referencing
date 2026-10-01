@@ -2,7 +2,14 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from enum import Enum
-from typing import Any, ClassVar, Generic, Protocol, TypeVar
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    ClassVar,
+    Generic,
+    Protocol,
+    TypeVar,
+)
 from urllib.parse import unquote, urldefrag, urljoin
 
 from attrs import evolve, field
@@ -11,6 +18,15 @@ from rpds import HashTrieMap, HashTrieSet, List
 from referencing import exceptions
 from referencing._attrs import frozen
 from referencing.typing import URI, Anchor as AnchorType, D, Mapping, Retrieve
+
+if TYPE_CHECKING:
+    from referencing.retrieval import (
+        Allow,
+        Deny,
+        RetrieveWith,
+        RetrievalPolicy,
+        RetrievalRequest,
+    )
 
 EMPTY_UNCRAWLED: HashTrieSet[URI] = HashTrieSet()
 EMPTY_PREVIOUS_RESOLVERS: List[URI] = List()
@@ -312,6 +328,12 @@ class Registry(Mapping[URI, Resource[D]]):
     registry is accessed. It must either return a `Resource` or else raise a
     `NoSuchResource` exception indicating that the resource does not exist
     even according to the retrieval logic.
+
+    The ``retrieval_policy`` argument receives each external lookup with the
+    original reference, resolved URI, source resource, and resolution chain.
+    It can allow the configured retriever, deny the lookup, or select another
+    retriever. Pass ``restrict_in_memory_resources=True`` to apply the same
+    policy to resources already stored in the registry.
     """
 
     _resources: HashTrieMap[URI, Resource[D]] = field(
@@ -322,6 +344,14 @@ class Registry(Mapping[URI, Resource[D]]):
     _anchors: HashTrieMap[tuple[URI, str], AnchorType[D]] = HashTrieMap()
     _uncrawled: HashTrieSet[URI] = EMPTY_UNCRAWLED
     _retrieve: Retrieve[D] = field(default=_fail_to_retrieve, alias="retrieve")
+    _retrieval_policy: RetrievalPolicy[D] | None = field(
+        default=None,
+        alias="retrieval_policy",
+    )
+    _restrict_in_memory_resources: bool = field(
+        default=False,
+        alias="restrict_in_memory_resources",
+    )
 
     def __getitem__(self, uri: URI) -> Resource[D]:
         """
@@ -410,27 +440,81 @@ class Registry(Mapping[URI, Resource[D]]):
         so the returned object is a `Retrieved` object which contains both the
         resource value as well as the registry which ultimately contained it.
         """
-        resource = self._resources.get(uri)
-        if resource is not None:
-            return Retrieved(registry=self, value=resource)
+        from referencing.retrieval import RetrievalRequest
 
-        registry = self.crawl()
+        request = RetrievalRequest(
+            ref=uri,
+            uri=uri,
+            source=None,
+            chain=(),
+        )
+        retrieved, _ = self._get_or_retrieve(request)
+        return retrieved
+
+    def _get_or_retrieve(
+        self,
+        request: RetrievalRequest[D],
+        registry: Registry[D] | None = None,
+    ) -> tuple[Retrieved[D, Resource[D]], bool]:
+        from referencing.retrieval import Allow, Deny, RetrieveWith
+
+        uri = request.uri
+        retrieve = self._retrieve
+
+        if registry is None:
+            resource = self._resources.get(uri)
+            if resource is not None and (
+                self._retrieval_policy is None
+                or not self._restrict_in_memory_resources
+            ):
+                return Retrieved(registry=self, value=resource), False
+            registry = self.crawl()
+
         resource = registry._resources.get(uri)
-        if resource is not None:
-            return Retrieved(registry=registry, value=resource)
+        if resource is not None and (
+            self._retrieval_policy is None
+            or not self._restrict_in_memory_resources
+        ):
+            return Retrieved(registry=registry, value=resource), False
+
+        if self._retrieval_policy is not None:
+            decision = self._retrieval_policy(request)
+            if isinstance(decision, Deny):
+                raise exceptions.RetrievalDenied(
+                    ref=uri,
+                    reason=decision.reason,
+                )
+            if isinstance(decision, RetrieveWith):
+                retrieve = decision.retrieve
+            elif not isinstance(decision, Allow):
+                message = (
+                    "Retrieval policies must return Allow, Deny, or "
+                    f"RetrieveWith, not {decision!r}."
+                )
+                raise TypeError(message)
+
+            if resource is not None and isinstance(decision, Allow):
+                return Retrieved(registry=registry, value=resource), False
 
         try:
-            resource = registry._retrieve(uri)
+            resource = retrieve(uri)
         except (
             exceptions.CannotDetermineSpecification,
             exceptions.NoSuchResource,
+            exceptions.RetrievalDenied,
         ):
             raise
         except Exception as error:
             raise exceptions.Unretrievable(ref=uri) from error
         else:
-            registry = registry.with_resource(uri, resource)
-            return Retrieved(registry=registry, value=resource)
+            try:
+                registry = registry.with_resource(uri, resource).crawl()
+            except Exception as error:
+                raise exceptions.Unretrievable(ref=uri) from error
+            return (
+                Retrieved(registry=registry, value=registry._resources[uri]),
+                True,
+            )
 
     def remove(self, uri: URI):
         """
@@ -552,10 +636,16 @@ class Registry(Mapping[URI, Resource[D]]):
         anchors = self._anchors
         uncrawled = self._uncrawled
         retrieve = self._retrieve
+        retrieval_policy = self._retrieval_policy
+        restrict_in_memory_resources = self._restrict_in_memory_resources
         for registry in registries:
             resources = resources.update(registry._resources)
             anchors = anchors.update(registry._anchors)
             uncrawled = uncrawled.update(registry._uncrawled)
+            restrict_in_memory_resources = (
+                restrict_in_memory_resources
+                or registry._restrict_in_memory_resources
+            )
 
             if registry._retrieve is not _fail_to_retrieve:
                 if registry._retrieve is not retrieve is not _fail_to_retrieve:
@@ -564,19 +654,37 @@ class Registry(Mapping[URI, Resource[D]]):
                         "functions.",
                     )
                 retrieve = registry._retrieve
+
+            if registry._retrieval_policy is not None:
+                if (
+                    registry._retrieval_policy
+                    is not retrieval_policy
+                    is not None
+                ):
+                    raise ValueError(  # noqa: TRY003
+                        "Cannot combine registries with conflicting "
+                        "retrieval policies.",
+                    )
+                retrieval_policy = registry._retrieval_policy
         return evolve(
             self,
             anchors=anchors,
             resources=resources,
             uncrawled=uncrawled,
             retrieve=retrieve,
+            retrieval_policy=retrieval_policy,
+            restrict_in_memory_resources=(
+                restrict_in_memory_resources
+            ),
         )
 
     def resolver(self, base_uri: URI = "") -> Resolver[D]:
         """
         Return a `Resolver` which resolves references against this registry.
         """
-        return Resolver(base_uri=base_uri, registry=self)
+        source = self.crawl()._resources.get(base_uri)
+        chain = (base_uri,) if source is not None else ()
+        return Resolver(base_uri=base_uri, registry=self, chain=chain)
 
     def resolver_with_root(self, resource: Resource[D]) -> Resolver[D]:
         """
@@ -586,6 +694,7 @@ class Registry(Mapping[URI, Resource[D]]):
         return Resolver(
             base_uri=uri,
             registry=self.with_resource(uri, resource),
+            chain=(uri,) if uri else (),
         )
 
 
@@ -644,6 +753,12 @@ class Resolver(Generic[D]):
     _base_uri: URI = field(alias="base_uri")
     _registry: Registry[D] = field(alias="registry")
     _previous: List[URI] = field(default=List(), repr=False, alias="previous")
+    _chain: tuple[URI, ...] = field(default=(), repr=False, alias="chain")
+    _external_resources: tuple[URI, ...] = field(
+        default=(),
+        repr=False,
+        alias="external_resources",
+    )
 
     def lookup(self, ref: URI) -> Resolved[D]:
         """
@@ -673,23 +788,75 @@ class Resolver(Generic[D]):
             uri, fragment = self._base_uri, ref[1:]
         else:
             uri, fragment = urldefrag(urljoin(self._base_uri, ref))
+
+        from referencing.retrieval import RetrievalRequest
+
+        crawled_registry = self._registry.crawl()
+        source = crawled_registry._resources.get(self._base_uri)
+        if (
+            ref.startswith("#")
+            and self._chain
+            and self._chain[-1] == uri
+        ):
+            depth = len(self._chain)
+        else:
+            depth = len(self._chain) + 1
+        request = RetrievalRequest(
+            ref=ref,
+            uri=uri,
+            source=source,
+            chain=self._chain,
+            retrieved_resources=tuple(dict.fromkeys(self._chain)),
+            external_resources=self._external_resources,
+            depth=depth,
+        )
         try:
-            retrieved = self._registry.get_or_retrieve(uri)
+            retrieved, was_retrieved = (
+                crawled_registry._get_or_retrieve(
+                    request,
+                    registry=crawled_registry,
+                )
+            )
         except exceptions.NoSuchResource:
             raise exceptions.Unresolvable(ref=ref) from None
+        except exceptions.RetrievalDenied:
+            raise
         except exceptions.Unretrievable as error:
             raise exceptions.Unresolvable(ref=ref) from error
 
+        external_resources = self._external_resources
+        if was_retrieved and uri not in external_resources:
+            external_resources = (*external_resources, uri)
+
+        chain = self._chain
+        if not chain or not ref.startswith("#") or chain[-1] != uri:
+            chain = (*chain, uri)
+
         if fragment.startswith("/"):
-            resolver = self._evolve(registry=retrieved.registry, base_uri=uri)
+            resolver = self._evolve(
+                registry=retrieved.registry,
+                base_uri=uri,
+                chain=chain,
+                external_resources=external_resources,
+            )
             return retrieved.value.pointer(pointer=fragment, resolver=resolver)
 
         if fragment:
             retrieved = retrieved.registry.anchor(uri, fragment)
-            resolver = self._evolve(registry=retrieved.registry, base_uri=uri)
+            resolver = self._evolve(
+                registry=retrieved.registry,
+                base_uri=uri,
+                chain=chain,
+                external_resources=external_resources,
+            )
             return retrieved.value.resolve(resolver=resolver)
 
-        resolver = self._evolve(registry=retrieved.registry, base_uri=uri)
+        resolver = self._evolve(
+            registry=retrieved.registry,
+            base_uri=uri,
+            chain=chain,
+            external_resources=external_resources,
+        )
         return Resolved(contents=retrieved.value.contents, resolver=resolver)
 
     def in_subresource(self, subresource: Resource[D]) -> Resolver[D]:
@@ -699,7 +866,11 @@ class Resolver(Generic[D]):
         id = subresource.id()
         if id is None:
             return self
-        return evolve(self, base_uri=urljoin(self._base_uri, id))
+        uri = urljoin(self._base_uri, id)
+        chain = self._chain
+        if not chain or chain[-1] != uri:
+            chain = (*chain, uri)
+        return evolve(self, base_uri=uri, chain=chain)
 
     def dynamic_scope(self) -> Iterable[tuple[URI, Registry[D]]]:
         """
@@ -715,7 +886,12 @@ class Resolver(Generic[D]):
         previous = self._previous
         if self._base_uri and (not previous or base_uri != self._base_uri):
             previous = previous.push_front(self._base_uri)
-        return evolve(self, base_uri=base_uri, previous=previous, **kwargs)
+        return evolve(
+            self,
+            base_uri=base_uri,
+            previous=previous,
+            **kwargs,
+        )
 
 
 @frozen

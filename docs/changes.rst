@@ -2,6 +2,15 @@
 Changelog
 =========
 
+v0.38.0
+--------
+
+* Add retrieval policies to `Registry`, allowing references to be allowed,
+  denied, or routed to a specific retriever before retrieval.
+* Add configurable policy enforcement for resources already present in memory.
+* Expose nested resolution chains, retrieved resource counts, and depths to
+  retrieval policies.
+
 v0.37.0
 -------
 

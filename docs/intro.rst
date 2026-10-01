@@ -267,3 +267,52 @@ The above example would be written:
     print(resolver.lookup("https://json-schema.org/draft/2020-12/schema"))
 
 It is otherwise functionally equivalent to the above, other than that retrieval will not repeatedly make a web request.
+
+
+Retrieval Policies
+^^^^^^^^^^^^^^^^^^
+
+Untrusted documents can contain references which attempt to make a process read an arbitrary file or network address.
+Pass a retrieval policy to control which references may be fetched before a retriever is called.
+A policy receives a `referencing.retrieval.RetrievalRequest` containing:
+
+* the original, unresolved reference;
+* its absolute URI after resolution against the current base URI;
+* the resource containing the reference;
+* the current resolution chain;
+* the resources and external fetches already used by that chain, along with its depth.
+
+Return `referencing.retrieval.Allow` to use the registry's default retriever, `referencing.retrieval.Deny` to reject the reference, or `referencing.retrieval.RetrieveWith` to use a different retriever for the request.
+
+.. testcode::
+
+    from referencing import Registry, Resource
+    from referencing.retrieval import Deny, RetrieveWith
+    from urllib.parse import unquote, urlsplit
+    import posixpath
+
+
+    def retrieve_file(uri):
+        return Resource.opaque({"loaded from": uri})
+
+
+    def policy(request):
+        parts = urlsplit(request.uri)
+        path = posixpath.normpath(unquote(parts.path))
+        if parts.scheme == "file" and path.startswith("/allowed/"):
+            return RetrieveWith(retrieve_file)
+        return Deny("only allowed files may be retrieved")
+
+
+    registry = Registry(retrieval_policy=policy)
+
+    print(registry.resolver().lookup("file:///allowed/schema.json").contents)
+
+By default, resources already present in memory remain directly available
+and are not passed to the policy, matching normal registry behavior.
+Set ``restrict_in_memory_resources=True`` if those resources also represent tenant-controlled data and must be policy-checked.
+
+The request's ``retrieved_resources`` and ``depth`` values are shared by
+nested lookups through the returned resolver, so a policy can enforce a
+budget for an entire resolution chain.
+Percent-encoded path segments can be decoded within the policy before checking the path.

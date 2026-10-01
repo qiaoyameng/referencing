@@ -24,6 +24,10 @@ thunks = (
     lambda: exceptions.PointerToNowhere(resource=TRUE, ref="urn:example:foo"),
     lambda: exceptions.Unresolvable("urn:example:foo"),
     lambda: exceptions.Unretrievable("urn:example:foo"),
+    lambda: exceptions.RetrievalDenied(
+        "urn:example:foo",
+        reason="not allowed",
+    ),
 )
 
 

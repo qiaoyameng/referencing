@@ -74,6 +74,30 @@ class Unretrievable(KeyError):
         return hash(attrs.astuple(self))
 
 
+@attrs.frozen
+class RetrievalDenied(KeyError):
+    """
+    A retrieval policy denied access to the given URI.
+    """
+
+    ref: URI
+    reason: str | None = None
+
+    def __eq__(self, other: object) -> bool:
+        if self.__class__ is not other.__class__:
+            return NotImplemented
+        return attrs.astuple(self) == attrs.astuple(other)
+
+    def __hash__(self) -> int:
+        return hash(attrs.astuple(self))
+
+    def __str__(self) -> str:
+        message = f"Retrieval of {self.ref!r} was denied by policy"
+        if self.reason is not None:
+            message += f": {self.reason}"
+        return message
+
+
 @frozen
 class CannotDetermineSpecification(Exception):
     """
