@@ -2,6 +2,13 @@
 Changelog
 =========
 
+v0.38.0
+-------
+
+* Add an opt-in strict mode to ``Registry`` (via ``Registry(strict=True)``) which detects conflicting resources instead of silently letting registration or crawling order decide which one wins.
+  In strict mode, adding a different resource under an already-known URI -- including URIs discovered later by expanding the internal IDs of lazily-crawled subresources -- raises ``referencing.exceptions.ConflictingResource``, and duplicate anchor names within a single resource raise ``referencing.exceptions.ConflictingAnchor``.
+  Re-adding an identical resource or anchor remains idempotent, and failed operations leave the original (immutable) registry untouched.
+
 v0.37.0
 -------
 

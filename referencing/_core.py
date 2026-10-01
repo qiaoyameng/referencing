@@ -312,6 +312,17 @@ class Registry(Mapping[URI, Resource[D]]):
     registry is accessed. It must either return a `Resource` or else raise a
     `NoSuchResource` exception indicating that the resource does not exist
     even according to the retrieval logic.
+
+    The ``strict`` argument enables strict conflict detection. In strict
+    mode, adding a resource whose URI is already associated with
+    *different* contents raises `exceptions.ConflictingResource` instead of
+    silently replacing (or being replaced by) the existing resource. The
+    same check is applied to URIs discovered later, while crawling, by
+    expanding the internal IDs of (possibly nested) subresources, as well
+    as to duplicate anchor names within a single resource, which raise
+    `exceptions.ConflictingAnchor`. Re-adding an identical resource (or
+    anchor) remains idempotent. As registries are immutable, a failed
+    operation leaves the original registry untouched and usable.
     """
 
     _resources: HashTrieMap[URI, Resource[D]] = field(
@@ -322,6 +333,7 @@ class Registry(Mapping[URI, Resource[D]]):
     _anchors: HashTrieMap[tuple[URI, str], AnchorType[D]] = HashTrieMap()
     _uncrawled: HashTrieSet[URI] = EMPTY_UNCRAWLED
     _retrieve: Retrieve[D] = field(default=_fail_to_retrieve, alias="retrieve")
+    _strict: bool = field(default=False, alias="strict")
 
     def __getitem__(self, uri: URI) -> Resource[D]:
         """
@@ -375,19 +387,22 @@ class Registry(Mapping[URI, Resource[D]]):
 
                 if the resource(s) in fact do not have IDs
 
+            `ConflictingResource`
+
+                in strict mode, if a different resource is already
+                associated with one of the resources' IDs
+
         """
         if isinstance(new, Resource):
             new = (new,)
 
-        resources = self._resources
-        uncrawled = self._uncrawled
+        pairs = []
         for resource in new:
             id = resource.id()
             if id is None:
                 raise exceptions.NoInternalID(resource=resource)
-            uncrawled = uncrawled.insert(id)
-            resources = resources.insert(id, resource)
-        return evolve(self, resources=resources, uncrawled=uncrawled)
+            pairs.append((id, resource))
+        return self.with_resources(pairs)
 
     def __repr__(self) -> str:
         size = len(self)
@@ -485,6 +500,19 @@ class Registry(Mapping[URI, Resource[D]]):
     def crawl(self) -> Registry[D]:
         """
         Crawl all added resources, discovering subresources.
+
+        Raises:
+
+            `ConflictingResource`
+
+                in strict mode, if a discovered (sub)resource's ID --
+                after expanding it against its base URI -- is already
+                associated with different contents
+
+            `ConflictingAnchor`
+
+                in strict mode, if two different anchors with the same
+                name are discovered within a single resource
         """
         resources = self._resources
         anchors = self._anchors
@@ -495,8 +523,25 @@ class Registry(Mapping[URI, Resource[D]]):
             id = resource.id()
             if id is not None:
                 uri = urljoin(uri, id)
+                if self._strict:
+                    existing = resources.get(uri)
+                    if existing is not None and existing != resource:
+                        raise exceptions.ConflictingResource(
+                            uri=uri,
+                            existing=existing,
+                            new=resource,
+                        )
                 resources = resources.insert(uri, resource)
             for each in resource.anchors():
+                if self._strict:
+                    existing = anchors.get((uri, each.name))
+                    if existing is not None and existing != each:
+                        raise exceptions.ConflictingAnchor(
+                            uri=uri,
+                            name=each.name,
+                            existing=existing,
+                            new=each,
+                        )
                 anchors = anchors.insert((uri, each.name), each)
             uncrawled.extend((uri, each) for each in resource.subresources())
         return evolve(
@@ -518,6 +563,13 @@ class Registry(Mapping[URI, Resource[D]]):
     ) -> Registry[D]:
         r"""
         Add the given `Resource`\ s to the registry, without crawling them.
+
+        Raises:
+
+            `ConflictingResource`
+
+                in strict mode, if a different resource is already
+                associated with one of the given URIs
         """
         resources = self._resources
         uncrawled = self._uncrawled
@@ -525,6 +577,16 @@ class Registry(Mapping[URI, Resource[D]]):
             # Empty fragment URIs are equivalent to URIs without the fragment.
             # TODO: Is this true for non JSON Schema resources? Probably not.
             uri = uri.rstrip("#")
+            if self._strict:
+                existing = resources.get(uri)
+                if existing is not None:
+                    if existing == resource:
+                        continue
+                    raise exceptions.ConflictingResource(
+                        uri=uri,
+                        existing=existing,
+                        new=resource,
+                    )
             uncrawled = uncrawled.insert(uri)
             resources = resources.insert(uri, resource)
         return evolve(self, resources=resources, uncrawled=uncrawled)

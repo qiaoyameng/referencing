@@ -576,6 +576,209 @@ class TestRegistry:
         assert repr(Registry()) == "<Registry (0 resources)>"
 
 
+class TestStrictRegistry:
+    def test_readding_the_same_resource_is_idempotent(self):
+        uri = "urn:example"
+        resource = Resource.opaque(contents={"foo": "bar"})
+        registry = Registry(strict=True).with_resource(uri, resource)
+        assert registry.with_resource(uri, resource) == registry
+
+    def test_readding_equal_contents_is_idempotent(self):
+        uri = "urn:example"
+        registry = Registry(strict=True).with_resource(
+            uri,
+            Resource.opaque(contents={"foo": "bar"}),
+        )
+        assert registry.with_resource(
+            uri,
+            Resource.opaque(contents={"foo": "bar"}),
+        ) == registry
+
+    def test_conflicting_resource(self):
+        uri = "urn:example"
+        one = Resource.opaque(contents={"foo": "bar"})
+        two = Resource.opaque(contents={"foo": "baz"})
+        registry = Registry(strict=True).with_resource(uri, one)
+        with pytest.raises(exceptions.ConflictingResource) as e:
+            registry.with_resource(uri, two)
+        assert e.value == exceptions.ConflictingResource(
+            uri=uri,
+            existing=one,
+            new=two,
+        )
+        assert uri in str(e.value)
+
+    def test_conflicting_resource_in_either_order(self):
+        uri = "urn:example"
+        one = Resource.opaque(contents={"foo": "bar"})
+        two = Resource.opaque(contents={"foo": "baz"})
+
+        with pytest.raises(exceptions.ConflictingResource):
+            Registry(strict=True).with_resource(uri, one).with_resource(
+                uri,
+                two,
+            )
+        with pytest.raises(exceptions.ConflictingResource):
+            Registry(strict=True).with_resource(uri, two).with_resource(
+                uri,
+                one,
+            )
+
+    def test_conflicting_resource_via_internal_id(self):
+        uri = "urn:example"
+        one = ID_AND_CHILDREN.create_resource({"ID": uri, "foo": 12})
+        two = ID_AND_CHILDREN.create_resource({"ID": uri, "foo": 37})
+        with pytest.raises(exceptions.ConflictingResource):
+            two @ (one @ Registry(strict=True))
+        with pytest.raises(exceptions.ConflictingResource):
+            one @ (two @ Registry(strict=True))
+
+    def test_failed_addition_leaves_registry_usable(self):
+        uri = "urn:example"
+        one = Resource.opaque(contents={"foo": "bar"})
+        two = Resource.opaque(contents={"foo": "baz"})
+        registry = Registry(strict=True).with_resource(uri, one)
+        with pytest.raises(exceptions.ConflictingResource):
+            registry.with_resource(uri, two)
+        assert registry[uri] is one
+        assert len(registry) == 1
+
+    def test_conflicting_ids_discovered_while_crawling(self):
+        """
+        A conflict hidden in a not-yet-crawled nested resource is detected.
+        """
+        child = {"$id": "child", "type": "string"}
+        root = DRAFT202012.create_resource(
+            {
+                "$id": "https://example.com/root",
+                "$defs": {"child": child},
+            },
+        )
+        conflicting = DRAFT202012.create_resource(
+            {"$id": "https://example.com/child", "type": "integer"},
+        )
+        registry = Registry(strict=True).with_resources(
+            [
+                ("https://example.com/root", root),
+                ("https://example.com/child", conflicting),
+            ],
+        )
+        with pytest.raises(exceptions.ConflictingResource) as e:
+            registry.crawl()
+        assert e.value.uri == "https://example.com/child"
+
+    def test_conflicting_ids_discovered_while_crawling_either_order(self):
+        """
+        The crawl order (and registration order) does not matter.
+        """
+        one = ID_AND_CHILDREN.create_resource(
+            {
+                "ID": "https://example.com/one",
+                "children": [{"ID": "shared", "foo": 1}],
+            },
+        )
+        two = ID_AND_CHILDREN.create_resource(
+            {
+                "ID": "https://example.com/two",
+                "children": [{"ID": "shared", "foo": 2}],
+            },
+        )
+        pairs = [
+            ("https://example.com/one", one),
+            ("https://example.com/two", two),
+        ]
+        with pytest.raises(exceptions.ConflictingResource):
+            Registry(strict=True).with_resources(pairs).crawl()
+        with pytest.raises(exceptions.ConflictingResource):
+            Registry(strict=True).with_resources(pairs[::-1]).crawl()
+
+    def test_first_resolution_enforces_crawled_conflicts(self):
+        """
+        Resolving a reference crawls, and hence hits the same checks.
+        """
+        root = DRAFT202012.create_resource(
+            {
+                "$id": "https://example.com/root",
+                "$defs": {
+                    "child": {"$id": "child", "type": "string"},
+                    "other": {"$id": "other", "type": "boolean"},
+                },
+            },
+        )
+        conflicting = DRAFT202012.create_resource(
+            {"$id": "https://example.com/child", "type": "integer"},
+        )
+        registry = Registry(strict=True).with_resources(
+            [
+                ("https://example.com/root", root),
+                ("https://example.com/child", conflicting),
+            ],
+        )
+        with pytest.raises(exceptions.ConflictingResource):
+            registry.resolver().lookup("https://example.com/other")
+
+    def test_failed_crawl_leaves_registry_usable(self):
+        one = ID_AND_CHILDREN.create_resource(
+            {
+                "ID": "https://example.com/one",
+                "children": [{"ID": "shared", "foo": 1}],
+            },
+        )
+        two = ID_AND_CHILDREN.create_resource(
+            {
+                "ID": "https://example.com/two",
+                "children": [{"ID": "shared", "foo": 2}],
+            },
+        )
+        registry = Registry(strict=True).with_resources(
+            [
+                ("https://example.com/one", one),
+                ("https://example.com/two", two),
+            ],
+        )
+        with pytest.raises(exceptions.ConflictingResource):
+            registry.crawl()
+        assert registry["https://example.com/one"] is one
+        assert registry["https://example.com/two"] is two
+        assert len(registry) == 2
+
+    def test_conflicting_anchors_within_one_resource(self):
+        root = ID_AND_CHILDREN.create_resource(
+            {
+                "ID": "urn:example:root",
+                "children": [
+                    {"anchors": {"foo": {"a": 1}}},
+                    {"anchors": {"foo": {"b": 2}}},
+                ],
+            },
+        )
+        registry = root @ Registry(strict=True)
+        with pytest.raises(exceptions.ConflictingAnchor) as e:
+            registry.crawl()
+        assert e.value.uri == "urn:example:root"
+        assert e.value.name == "foo"
+
+    def test_identical_anchors_within_one_resource_are_idempotent(self):
+        root = ID_AND_CHILDREN.create_resource(
+            {
+                "ID": "urn:example:root",
+                "children": [
+                    {"anchors": {"foo": {"a": 1}}},
+                    {"anchors": {"foo": {"a": 1}}},
+                ],
+            },
+        )
+        registry = (root @ Registry(strict=True)).crawl()
+        assert registry.anchor("urn:example:root", "foo").value.name == "foo"
+
+    def test_non_strict_registries_still_tolerate_conflicts(self):
+        uri = "urn:example"
+        one = Resource.opaque(contents={"foo": "bar"})
+        two = Resource.opaque(contents={"foo": "baz"})
+        registry = Registry().with_resource(uri, one).with_resource(uri, two)
+        assert registry[uri] is two
+
+
 class TestResource:
     def test_from_contents_from_json_schema(self):
         schema = {"$schema": "https://json-schema.org/draft/2020-12/schema"}

@@ -11,7 +11,7 @@ import attrs
 from referencing._attrs import frozen
 
 if TYPE_CHECKING:
-    from referencing import Resource
+    from referencing import Anchor, Resource
     from referencing.typing import URI
 
 
@@ -92,6 +92,71 @@ class CannotDetermineSpecification(Exception):
 
     def __hash__(self) -> int:
         return hash(attrs.astuple(self))
+
+
+@frozen
+class ConflictingResource(Exception):
+    """
+    A different resource is already known under the same URI.
+
+    This is only raised by registries in strict mode (see `Registry`),
+    where adding a resource whose URI -- either the one it was added
+    under, or one discovered later by expanding its internal ID while
+    crawling -- is already associated with different contents is an
+    error, rather than silently replacing (or being replaced by) the
+    existing resource.
+    """
+
+    uri: URI
+    existing: Resource[Any]
+    new: Resource[Any]
+
+    def __eq__(self, other: object) -> bool:
+        if self.__class__ is not other.__class__:
+            return NotImplemented
+        return attrs.astuple(self) == attrs.astuple(other)
+
+    def __hash__(self) -> int:
+        return hash(attrs.astuple(self))
+
+    def __str__(self) -> str:
+        return (
+            f"{self.uri!r} is already associated with different contents: "
+            f"{self.existing.contents!r} (cannot also be associated with "
+            f"{self.new.contents!r})"
+        )
+
+
+@frozen
+class ConflictingAnchor(Exception):
+    """
+    Two different anchors with the same name exist within one resource.
+
+    This is only raised by registries in strict mode (see `Registry`),
+    where discovering a duplicate anchor name under a single resource's
+    URI is an error, rather than silently keeping one of them.
+    """
+
+    uri: URI
+    name: str
+    existing: Anchor[Any]
+    new: Anchor[Any]
+
+    def __eq__(self, other: object) -> bool:
+        if self.__class__ is not other.__class__:
+            return NotImplemented
+        return attrs.astuple(self) == attrs.astuple(other)
+
+    def __hash__(self) -> int:
+        return hash(attrs.astuple(self))
+
+    def __str__(self) -> str:
+        return (
+            f"The anchor {self.name!r} appears more than once within "
+            f"{self.uri!r}, with differing contents: "
+            f"{self.existing.resource.contents!r} and "
+            f"{self.new.resource.contents!r}"
+        )
 
 
 @attrs.frozen  # Because here we allow subclassing below.
