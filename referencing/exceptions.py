@@ -111,6 +111,52 @@ class Unresolvable(Exception):
         return hash(attrs.astuple(self))
 
 
+@attrs.frozen  # Because here we allow subclassing below.
+class RetrievalDenied(Unresolvable):
+    """
+    A reference was denied by a retrieval policy.
+
+    Unlike a resource which simply does not exist, here a policy explicitly
+    decided that the given reference must not be retrieved (nor returned from
+    already-known in-memory resources, when those too are subject to the
+    policy).
+
+    The policy may attach a human-readable ``reason`` describing why.
+    """
+
+    reason: str | None = None
+
+    def __str__(self) -> str:
+        message = (
+            f"Retrieval of {self.ref!r} was denied by the retrieval policy"
+        )
+        if self.reason is not None:
+            message += f": {self.reason}"
+        return message
+
+
+@frozen
+class RetrievalQuotaExceeded(RetrievalDenied):
+    """
+    A retrieval exceeded a resource-count or depth quota.
+
+    Quotas are shared across an entire nested resolution chain, such that a
+    chain of references cannot cause an unbounded number of retrievals or
+    arbitrarily deep nesting.
+    """
+
+    limit: int = 0
+
+    def __str__(self) -> str:
+        unit = self.reason or "resources"
+        if self.limit == 1:
+            unit = unit.rstrip("s")
+        return (
+            f"Retrieval of {self.ref!r} exceeded the quota of "
+            f"{self.limit} {unit}"
+        )
+
+
 @frozen
 class PointerToNowhere(Unresolvable):
     """

@@ -2,6 +2,25 @@
 Changelog
 =========
 
+v0.38.0
+-------
+
+* Add support for a retrieval policy on ``Registry`` (via the new
+  ``policy`` argument), which is consulted with the raw reference, the
+  resolved absolute URI, the originating resource and the current
+  resolution chain. A policy may allow a retrieval, deny it *before* any
+  retriever is called (raising ``referencing.exceptions.RetrievalDenied``),
+  or hand the request to a specifically chosen retriever.
+* Whether already-present in-memory resources are subject to the policy is
+  configurable via ``policy_applies_to_resources`` (which defaults to
+  ``True``).
+* Add ``max_retrieved_resources`` and ``max_depth`` arguments to
+  ``Registry``, which bound the number of fetched resources and nested
+  documents shared across a single resolution chain. Exceeding either
+  raises ``referencing.exceptions.RetrievalQuotaExceeded``.
+* A failed (denied or otherwise errored) retrieval never leaves a partially
+  retrieved resource in the returned registry.
+
 v0.37.0
 -------
 

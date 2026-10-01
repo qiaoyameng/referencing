@@ -8,6 +8,7 @@ from collections.abc import Mapping as Mapping
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
 if TYPE_CHECKING:
+    from referencing.retrieval import Decision, RetrievalRequest
     from referencing._core import Resolved, Resolver, Resource
 
 #: A URI which identifies a `Resource`.
@@ -30,6 +31,29 @@ class Retrieve(Protocol[D]):
 
         Raise `referencing.exceptions.NoSuchResource` if you wish to indicate
         the retriever cannot lookup the given URI.
+        """
+        ...
+
+
+class RetrievalPolicy(Protocol[D]):
+    """
+    A policy which decides whether a given reference may be accessed.
+
+    The policy receives a `~referencing.retrieval.RetrievalRequest` and
+    returns either an :class:`~referencing.retrieval.Allow`,
+    :class:`~referencing.retrieval.Deny`, or
+    :class:`~referencing.retrieval.RetrieveWith` decision (a return value of
+    ``None`` is treated as an allow).
+
+    The policy is always consulted *before* any retriever is called.
+    """
+
+    def __call__(
+        self,
+        request: RetrievalRequest[D],
+    ) -> Decision | None:
+        """
+        Decide what to do with the given retrieval request.
         """
         ...
 

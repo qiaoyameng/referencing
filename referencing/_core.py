@@ -2,7 +2,14 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from enum import Enum
-from typing import Any, ClassVar, Generic, Protocol, TypeVar
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    ClassVar,
+    Generic,
+    Protocol,
+    TypeVar,
+)
 from urllib.parse import unquote, urldefrag, urljoin
 
 from attrs import evolve, field
@@ -10,10 +17,37 @@ from rpds import HashTrieMap, HashTrieSet, List
 
 from referencing import exceptions
 from referencing._attrs import frozen
-from referencing.typing import URI, Anchor as AnchorType, D, Mapping, Retrieve
+from referencing.typing import (
+    URI,
+    Anchor as AnchorType,
+    D,
+    Mapping,
+    Retrieve,
+    RetrievalPolicy,
+)
+
+if TYPE_CHECKING:
+    from referencing import retrieval
 
 EMPTY_UNCRAWLED: HashTrieSet[URI] = HashTrieSet()
 EMPTY_PREVIOUS_RESOLVERS: List[URI] = List()
+
+
+@frozen
+class _ResolutionContext:
+    """
+    The shared state of a chain of nested resolutions.
+
+    A single context is threaded through every `Resolver` produced while
+    resolving nested references, so that resource-count and depth quotas are
+    shared across the whole chain rather than reset at each hop.
+    """
+
+    #: The absolute URIs of the documents already entered, root-first.
+    chain: tuple[URI, ...] = ()
+
+    #: The number of resources actually fetched via retrievers so far.
+    retrieved: int = 0
 
 
 class _Unset(Enum):
@@ -312,6 +346,19 @@ class Registry(Mapping[URI, Resource[D]]):
     registry is accessed. It must either return a `Resource` or else raise a
     `NoSuchResource` exception indicating that the resource does not exist
     even according to the retrieval logic.
+
+    The ``policy`` argument can be used to gate every resource access behind
+    a `~referencing.typing.RetrievalPolicy`. The policy receives the raw
+    reference, the resolved absolute URI, the originating resource and the
+    current resolution chain, and may allow the access, deny it (before any
+    retriever is called), or hand it to a specifically chosen retriever.
+
+    By default an in-memory resource is still subject to the policy; pass
+    ``policy_applies_to_resources=False`` to only gate dynamic retrievals.
+
+    The ``max_retrieved_resources`` and ``max_depth`` arguments bound the
+    number of resources fetched and the depth of documents traversed by a
+    single nested resolution chain.
     """
 
     _resources: HashTrieMap[URI, Resource[D]] = field(
@@ -322,6 +369,16 @@ class Registry(Mapping[URI, Resource[D]]):
     _anchors: HashTrieMap[tuple[URI, str], AnchorType[D]] = HashTrieMap()
     _uncrawled: HashTrieSet[URI] = EMPTY_UNCRAWLED
     _retrieve: Retrieve[D] = field(default=_fail_to_retrieve, alias="retrieve")
+    _policy: RetrievalPolicy[D] | None = field(default=None, alias="policy")
+    _policy_applies_to_resources: bool = field(
+        default=True,
+        alias="policy_applies_to_resources",
+    )
+    _max_retrieved_resources: int | None = field(
+        default=None,
+        alias="max_retrieved_resources",
+    )
+    _max_depth: int | None = field(default=None, alias="max_depth")
 
     def __getitem__(self, uri: URI) -> Resource[D]:
         """
@@ -410,27 +467,92 @@ class Registry(Mapping[URI, Resource[D]]):
         so the returned object is a `Retrieved` object which contains both the
         resource value as well as the registry which ultimately contained it.
         """
-        resource = self._resources.get(uri)
-        if resource is not None:
-            return Retrieved(registry=self, value=resource)
+        from referencing import retrieval
 
-        registry = self.crawl()
-        resource = registry._resources.get(uri)
-        if resource is not None:
-            return Retrieved(registry=registry, value=resource)
+        request = retrieval.RetrievalRequest(
+            raw_ref=uri,
+            uri=uri,
+            origin=None,
+            chain=(),
+        )
+        retrieved, _ = self._gated_get_or_retrieve(
+            request=request,
+            context=None,
+            entering=False,
+        )
+        return retrieved
+
+    def _gated_get_or_retrieve(
+        self,
+        request: "retrieval.RetrievalRequest[D]",
+        context: _ResolutionContext | None,
+        entering: bool,
+    ) -> tuple[Retrieved[D, Resource[D]], bool]:
+        """
+        Retrieve, consulting the configured policy before any fetch.
+
+        ``context`` carries the shared nested-resolution quotas (or is
+        ``None`` for a direct registry lookup). ``entering`` indicates that
+        the request enters a (possibly new) document of the chain.
+        """
+        uri = request.uri
+
+        from referencing import retrieval
+        from referencing.retrieval import Allow
+
+        resource = self._resources.get(uri)
+        if resource is not None and not (
+            self._policy is not None
+            and self._policy_applies_to_resources
+        ):
+            return Retrieved(registry=self, value=resource), True
+
+        registry = self
+        if resource is None:
+            registry = self.crawl()
+            resource = registry._resources.get(uri)
+
+        retriever: Retrieve[D] = registry._retrieve
+        if self._policy is not None:
+            decision = self._policy(request)
+            if decision is None or isinstance(decision, Allow):
+                if resource is not None:
+                    return Retrieved(registry=registry, value=resource), True
+            elif isinstance(decision, retrieval.Deny):
+                raise exceptions.RetrievalDenied(
+                    ref=uri,
+                    reason=decision.reason,
+                )
+            else:
+                retriever = decision.retrieve
+                resource = None
+        elif resource is not None:
+            return Retrieved(registry=registry, value=resource), True
+
+        if (
+            context is not None
+            and self._max_retrieved_resources is not None
+            and context.retrieved >= self._max_retrieved_resources
+        ):
+            raise exceptions.RetrievalQuotaExceeded(
+                ref=uri,
+                reason="retrieved resources",
+                limit=self._max_retrieved_resources,
+            )
 
         try:
-            resource = registry._retrieve(uri)
+            resource = retriever(uri)
         except (
             exceptions.CannotDetermineSpecification,
             exceptions.NoSuchResource,
+            exceptions.RetrievalDenied,
         ):
             raise
         except Exception as error:
             raise exceptions.Unretrievable(ref=uri) from error
         else:
             registry = registry.with_resource(uri, resource)
-            return Retrieved(registry=registry, value=resource)
+            return Retrieved(registry=registry, value=resource), False
 
     def remove(self, uri: URI):
         """
@@ -552,6 +674,10 @@ class Registry(Mapping[URI, Resource[D]]):
         anchors = self._anchors
         uncrawled = self._uncrawled
         retrieve = self._retrieve
+        policy = self._policy
+        policy_applies_to_resources = self._policy_applies_to_resources
+        max_retrieved_resources = self._max_retrieved_resources
+        max_depth = self._max_depth
         for registry in registries:
             resources = resources.update(registry._resources)
             anchors = anchors.update(registry._anchors)
@@ -564,12 +690,52 @@ class Registry(Mapping[URI, Resource[D]]):
                         "functions.",
                     )
                 retrieve = registry._retrieve
+
+            if registry._policy is not None:
+                if policy is not None and registry._policy is not policy:
+                    raise ValueError(  # noqa: TRY003
+                        "Cannot combine registries with conflicting "
+                        "retrieval policies.",
+                    )
+                policy = registry._policy
+            policy_applies_to_resources = (
+                policy_applies_to_resources
+                and registry._policy_applies_to_resources
+            )
+
+            if registry._max_retrieved_resources is not None:
+                if (
+                    max_retrieved_resources is not None
+                    and max_retrieved_resources
+                    != registry._max_retrieved_resources
+                ):
+                    raise ValueError(  # noqa: TRY003
+                        "Cannot combine registries with conflicting "
+                        "retrieved-resource quotas.",
+                    )
+                max_retrieved_resources = registry._max_retrieved_resources
+
+            if registry._max_depth is not None:
+                if (
+                    max_depth is not None
+                    and max_depth
+                    != registry._max_depth
+                ):
+                    raise ValueError(  # noqa: TRY003
+                        "Cannot combine registries with conflicting "
+                        "resolution depth quotas.",
+                    )
+                max_depth = registry._max_depth
         return evolve(
             self,
             anchors=anchors,
             resources=resources,
             uncrawled=uncrawled,
             retrieve=retrieve,
+            policy=policy,
+            policy_applies_to_resources=policy_applies_to_resources,
+            max_retrieved_resources=max_retrieved_resources,
+            max_depth=max_depth,
         )
 
     def resolver(self, base_uri: URI = "") -> Resolver[D]:
@@ -644,6 +810,11 @@ class Resolver(Generic[D]):
     _base_uri: URI = field(alias="base_uri")
     _registry: Registry[D] = field(alias="registry")
     _previous: List[URI] = field(default=List(), repr=False, alias="previous")
+    _context: _ResolutionContext | None = field(
+        default=None,
+        repr=False,
+        alias="context",
+    )
 
     def lookup(self, ref: URI) -> Resolved[D]:
         """
@@ -669,27 +840,91 @@ class Resolver(Generic[D]):
                 that does not exist
 
         """
-        if ref.startswith("#"):
+        from referencing import retrieval
+
+        context = self._context
+        if context is None:
+            context = _ResolutionContext(
+                chain=(self._base_uri,) if self._base_uri else (),
+            )
+
+        fragment_only = ref.startswith("#")
+        if fragment_only:
             uri, fragment = self._base_uri, ref[1:]
         else:
             uri, fragment = urldefrag(urljoin(self._base_uri, ref))
+
+        origin = self._registry._resources.get(self._base_uri)
+
+        entering = not fragment_only and (
+            not context.chain or uri != context.chain[-1]
+        )
+        candidate_chain = (
+            context.chain + (uri,) if entering else context.chain
+        )
+        if (
+            entering
+            and self._registry._max_depth is not None
+            and len(candidate_chain) > self._registry._max_depth
+        ):
+            raise exceptions.RetrievalQuotaExceeded(
+                ref=uri,
+                reason="documents in the resolution chain",
+                limit=self._registry._max_depth,
+            )
+
+        request = retrieval.RetrievalRequest(
+            raw_ref=ref,
+            uri=uri,
+            origin=origin,
+            chain=context.chain,
+        )
+
         try:
-            retrieved = self._registry.get_or_retrieve(uri)
+            retrieved, already_known = self._registry._gated_get_or_retrieve(
+                request=request,
+                context=context,
+                entering=entering,
+            )
         except exceptions.NoSuchResource:
             raise exceptions.Unresolvable(ref=ref) from None
         except exceptions.Unretrievable as error:
             raise exceptions.Unresolvable(ref=ref) from error
+        except (
+            exceptions.RetrievalDenied,
+            exceptions.RetrievalQuotaExceeded,
+        ) as denied:
+            if denied.ref == ref:
+                raise
+            raise evolve(denied, ref=ref) from None
+
+        context = _ResolutionContext(
+            chain=candidate_chain,
+            retrieved=context.retrieved + (not already_known),
+        )
 
         if fragment.startswith("/"):
-            resolver = self._evolve(registry=retrieved.registry, base_uri=uri)
+            resolver = self._evolve(
+                registry=retrieved.registry,
+                base_uri=uri,
+                context=context,
+            )
             return retrieved.value.pointer(pointer=fragment, resolver=resolver)
 
         if fragment:
             retrieved = retrieved.registry.anchor(uri, fragment)
-            resolver = self._evolve(registry=retrieved.registry, base_uri=uri)
+            resolver = self._evolve(
+                registry=retrieved.registry,
+                base_uri=uri,
+                context=context,
+            )
             return retrieved.value.resolve(resolver=resolver)
 
-        resolver = self._evolve(registry=retrieved.registry, base_uri=uri)
+        resolver = self._evolve(
+            registry=retrieved.registry,
+            base_uri=uri,
+            context=context,
+        )
         return Resolved(contents=retrieved.value.contents, resolver=resolver)
 
     def in_subresource(self, subresource: Resource[D]) -> Resolver[D]:
@@ -715,6 +950,7 @@ class Resolver(Generic[D]):
         previous = self._previous
         if self._base_uri and (not previous or base_uri != self._base_uri):
             previous = previous.push_front(self._base_uri)
+        kwargs.setdefault("context", self._context)
         return evolve(self, base_uri=base_uri, previous=previous, **kwargs)
 
 
