@@ -576,6 +576,268 @@ class TestRegistry:
         assert repr(Registry()) == "<Registry (0 resources)>"
 
 
+@pytest.mark.parametrize("reverse", [False, True])
+class TestStrictRegistry:
+    def test_same_internal_id_conflicts_on_crawl(self, reverse):
+        """
+        Two resources declaring the same ID conflict, regardless of order.
+        """
+
+        one_uri = "urn:shared"
+        one = ID_AND_CHILDREN.create_resource({"ID": one_uri, "foo": 12})
+        two = ID_AND_CHILDREN.create_resource({"ID": one_uri, "foo": 34})
+
+        new = [two, one] if reverse else [one, two]
+        registry = Registry(strict=True).with_resources(
+            [("urn:external-one", new[0]), ("urn:external-two", new[1])],
+        )
+
+        with pytest.raises(exceptions.ConflictingResource) as first:
+            registry.crawl()
+
+        other = [one, two] if reverse else [two, one]
+        registry = Registry(strict=True).with_resources(
+            [
+                ("urn:external-one", other[0]),
+                ("urn:external-two", other[1]),
+            ],
+        )
+        with pytest.raises(exceptions.ConflictingResource) as second:
+            registry.crawl()
+
+        assert first.value == second.value
+        error = first.value
+        assert error.uri == one_uri
+        assert [error.existing, error.new] in ([one, two], [two, one])
+
+    def test_same_internal_id_conflicts_when_adding_by_id(self, reverse):
+        """
+        Adding resources directly by their internal ID also detects a clash.
+        """
+
+        one_uri = "urn:shared"
+        one = ID_AND_CHILDREN.create_resource({"ID": one_uri, "foo": 12})
+        two = ID_AND_CHILDREN.create_resource({"ID": one_uri, "foo": 34})
+
+        with pytest.raises(exceptions.ConflictingResource) as first:
+            two @ (one @ Registry(strict=True))
+        with pytest.raises(exceptions.ConflictingResource) as second:
+            one @ (two @ Registry(strict=True))
+
+        assert first.value == second.value
+        assert first.value.uri == one_uri
+
+    def test_relative_id_expansion_conflicts(self, reverse):
+        """
+        Relative IDs which expand to the same canonical URI conflict.
+        """
+
+        child_one = ID_AND_CHILDREN.create_resource(
+            {"ID": "child", "foo": 12},
+        )
+        child_two = ID_AND_CHILDREN.create_resource(
+            {"ID": "../child", "foo": 34},
+        )
+        roots = [
+            ID_AND_CHILDREN.create_resource(
+                {
+                    "ID": "http://example.com/a",
+                    "children": [child_one.contents],
+                },
+            ),
+            ID_AND_CHILDREN.create_resource(
+                {
+                    "ID": "http://example.com/b",
+                    "children": [child_two.contents],
+                },
+            ),
+        ]
+        if reverse:
+            roots.reverse()
+
+        registry = Registry(strict=True).with_resources(
+            [("urn:one", roots[0]), ("urn:two", roots[1])],
+        )
+        with pytest.raises(exceptions.ConflictingResource) as error:
+            registry.crawl()
+        assert error.value.uri == "http://example.com/child"
+
+    def test_conflict_hidden_in_uncrawled_nested_schema(self, reverse):
+        """
+        A conflict inside a nested schema is found on explicit crawl.
+        """
+
+        one = ID_AND_CHILDREN.create_resource(
+            {"ID": "urn:root-one", "children": [{"ID": "urn:child", "v": 1}]},
+        )
+        two = ID_AND_CHILDREN.create_resource(
+            {"ID": "urn:root-two", "children": [{"ID": "urn:child", "v": 2}]},
+        )
+        pair = [two, one] if reverse else [one, two]
+        registry = Registry(strict=True).with_resources(
+            [("urn:external-one", pair[0]), ("urn:external-two", pair[1])],
+        )
+
+        # Nothing is discovered until we crawl.
+        with pytest.raises(LookupError):
+            registry["urn:child"]
+
+        with pytest.raises(exceptions.ConflictingResource) as error:
+            registry.crawl()
+        assert error.value.uri == "urn:child"
+
+    def test_first_resolution_checks_lazy_subresource(self, reverse):
+        """
+        The first resolution triggers the same check as an explicit crawl.
+        """
+
+        one = ID_AND_CHILDREN.create_resource(
+            {"ID": "urn:root-one", "children": [{"ID": "urn:child", "v": 1}]},
+        )
+        two = ID_AND_CHILDREN.create_resource(
+            {"ID": "urn:root-two", "children": [{"ID": "urn:child", "v": 2}]},
+        )
+        pair = [two, one] if reverse else [one, two]
+        registry = Registry(strict=True).with_resources(
+            [("urn:external-one", pair[0]), ("urn:external-two", pair[1])],
+        )
+
+        with pytest.raises(exceptions.ConflictingResource) as error:
+            registry.resolver(base_uri="urn:root-one").lookup("urn:child")
+        assert error.value.uri == "urn:child"
+
+    def test_duplicate_anchor_in_one_resource(self, reverse):
+        """
+        Two differing anchors with the same name within a resource conflict.
+        """
+
+        # Each nested child has no ID, so its anchors belong to its parent
+        # resource -- and the two children declare anchors with one name.
+        target_one = {"v": 1}
+        target_two = {"v": 2}
+        children = [
+            {"anchors": {"foo": target_one}},
+            {"anchors": {"foo": target_two}},
+        ]
+        if reverse:
+            children.reverse()
+        root = ID_AND_CHILDREN.create_resource(
+            {"ID": "urn:root", "children": children},
+        )
+        registry = Registry(strict=True).with_resource("urn:external", root)
+        with pytest.raises(exceptions.ConflictingAnchor) as error:
+            registry.crawl()
+        assert error.value.uri == "urn:root"
+        assert error.value.anchor == "foo"
+
+    def test_equal_resource_is_idempotent(self, reverse):
+        """
+        Re-adding an equal resource never conflicts.
+        """
+
+        resource = ID_AND_CHILDREN.create_resource(
+            {"ID": "urn:same", "foo": 12},
+        )
+        pair = [resource, resource]
+        if reverse:
+            pair.reverse()
+
+        registry = Registry(strict=True).with_resources(
+            [("urn:external", resource), ("urn:other-external", resource)],
+        ).crawl()
+        assert registry["urn:same"] == resource
+
+        # The same is true when adding directly via an internal ID.
+        assert (resource @ registry) == (resource @ (resource @ registry))
+
+    def test_equal_anchor_is_idempotent(self, reverse):
+        """
+        Duplicate anchors pointing to equal contents do not conflict.
+        """
+
+        target = ID_AND_CHILDREN.create_resource({"v": 1})
+        resource = ID_AND_CHILDREN.create_resource(
+            {"ID": "urn:root", "anchors": {"foo": target.contents}},
+        )
+        registry = Registry(strict=True).with_resource(
+            "urn:external",
+            resource,
+        ).crawl()
+        assert registry.anchor("urn:root", "foo").value.name == "foo"
+
+    def test_failure_leaves_the_registry_usable(self, reverse):
+        """
+        Registries are immutable; a failed add or crawl is non-destructive.
+        """
+
+        one = ID_AND_CHILDREN.create_resource({"ID": "urn:shared", "v": 1})
+        two = ID_AND_CHILDREN.create_resource({"ID": "urn:shared", "v": 2})
+        pair = [two, one] if reverse else [one, two]
+
+        registry = Registry(strict=True).with_resource("urn:one", pair[0])
+        with pytest.raises(exceptions.ConflictingResource):
+            registry.with_resource("urn:two", pair[1]).crawl()
+
+        assert registry == Registry(strict=True).with_resource(
+            "urn:one",
+            pair[0],
+        )
+        crawled = registry.crawl()
+        assert crawled["urn:shared"] == pair[0]
+
+    def test_retrieved_subresource_cannot_bypass_strictness(self, reverse):
+        """
+        Subresources discovered via a retriever are still checked.
+        """
+
+        one = ID_AND_CHILDREN.create_resource({"ID": "urn:shared", "v": 1})
+        two = ID_AND_CHILDREN.create_resource({"ID": "urn:shared", "v": 2})
+
+        def retrieve(uri):
+            if uri == "urn:retrieved":
+                return two
+            raise exceptions.NoSuchResource(ref=uri)
+
+        registry = Registry(strict=True, retrieve=retrieve).with_resource(
+            "urn:one",
+            one,
+        )
+        retrieved = registry.get_or_retrieve("urn:retrieved")
+        with pytest.raises(exceptions.ConflictingResource) as error:
+            retrieved.registry.crawl()
+        assert error.value.uri == "urn:shared"
+
+    def test_combine_checks_conflicts(self, reverse):
+        """
+        Combining registries surfaces conflicting resources and anchors.
+        """
+
+        one = Resource.opaque(contents={})
+        two = ID_AND_CHILDREN.create_resource({"foo": "bar"})
+        pair = [two, one] if reverse else [one, two]
+        first = Registry(
+            strict=True,
+            resources=[("http://example.com", pair[0])],
+        )
+        second = Registry(resources=[("http://example.com", pair[1])])
+        with pytest.raises(exceptions.ConflictingResource) as error:
+            first.combine(second)
+        assert error.value.uri == "http://example.com"
+
+    def test_non_strict_registry_remains_permissive(self, reverse):
+        """
+        Without strict mode, conflicting resources do not raise.
+        """
+
+        one = ID_AND_CHILDREN.create_resource({"ID": "urn:shared", "v": 1})
+        two = ID_AND_CHILDREN.create_resource({"ID": "urn:shared", "v": 2})
+        pair = [two, one] if reverse else [one, two]
+        registry = Registry().with_resources(
+            [("urn:one", pair[0]), ("urn:two", pair[1])],
+        ).crawl()
+        assert registry["urn:shared"] in (one, two)
+
+
 class TestResource:
     def test_from_contents_from_json_schema(self):
         schema = {"$schema": "https://json-schema.org/draft/2020-12/schema"}

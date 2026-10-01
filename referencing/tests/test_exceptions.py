@@ -24,6 +24,17 @@ thunks = (
     lambda: exceptions.PointerToNowhere(resource=TRUE, ref="urn:example:foo"),
     lambda: exceptions.Unresolvable("urn:example:foo"),
     lambda: exceptions.Unretrievable("urn:example:foo"),
+    lambda: exceptions.ConflictingResource(
+        uri="urn:example:foo",
+        existing=TRUE,
+        new=Resource.opaque(False),
+    ),
+    lambda: exceptions.ConflictingAnchor(
+        uri="urn:example:foo",
+        anchor="foo",
+        existing=TRUE,
+        new=Resource.opaque(False),
+    ),
 )
 
 

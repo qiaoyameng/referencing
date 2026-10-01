@@ -289,6 +289,50 @@ def _fail_to_retrieve(uri: URI):
     raise exceptions.NoSuchResource(ref=uri)
 
 
+def _check_resource_conflict(
+    resources: HashTrieMap[URI, Resource[D]],
+    uri: URI,
+    resource: Resource[D],
+) -> None:
+    """
+    In a strict registry, raise if a different resource is already at a URI.
+
+    Resources equal to the one already present are ignored, so re-adding the
+    same resource (even more than once) is idempotent.
+    """
+    existing = resources.get(uri)
+    if existing is not None and existing != resource:
+        if repr(resource) < repr(existing):
+            existing, resource = resource, existing
+        raise exceptions.ConflictingResource(
+            uri=uri,
+            existing=existing,
+            new=resource,
+        )
+
+
+def _check_anchor_conflict(
+    anchors: HashTrieMap[tuple[URI, str], AnchorType[D]],
+    uri: URI,
+    anchor: AnchorType[D],
+) -> None:
+    """
+    In a strict registry, raise on two differing anchors sharing a name.
+
+    Equal anchors are allowed, making duplicate loading idempotent.
+    """
+    existing = anchors.get((uri, anchor.name))
+    if existing is not None and existing != anchor:
+        if repr(anchor.resource) < repr(existing.resource):
+            existing, anchor = anchor, existing
+        raise exceptions.ConflictingAnchor(
+            uri=uri,
+            anchor=anchor.name,
+            existing=existing.resource,
+            new=anchor.resource,
+        )
+
+
 @frozen
 class Registry(Mapping[URI, Resource[D]]):
     r"""
@@ -312,6 +356,21 @@ class Registry(Mapping[URI, Resource[D]]):
     registry is accessed. It must either return a `Resource` or else raise a
     `NoSuchResource` exception indicating that the resource does not exist
     even according to the retrieval logic.
+
+    Pass ``strict=True`` to create a registry which checks for conflicting
+    resources and anchors as resources are loaded and crawled.
+    A strict registry raises `referencing.exceptions.ConflictingResource` if
+    two different resources would end up registered under the same canonical
+    URI (whether because they declare the same ID or because relative IDs
+    expand to the same absolute URI), and
+    `referencing.exceptions.ConflictingAnchor` if a resource contains
+    different anchors sharing a name within the same resource.
+    Re-adding an equal resource or anchor is always allowed, so the result
+    never depends on registration or crawl order, and loading the same
+    document repeatedly remains idempotent.
+
+    As registries are immutable, a failing add or crawl leaves the registry
+    it was called on fully usable and unaffected by the conflict.
     """
 
     _resources: HashTrieMap[URI, Resource[D]] = field(
@@ -322,6 +381,7 @@ class Registry(Mapping[URI, Resource[D]]):
     _anchors: HashTrieMap[tuple[URI, str], AnchorType[D]] = HashTrieMap()
     _uncrawled: HashTrieSet[URI] = EMPTY_UNCRAWLED
     _retrieve: Retrieve[D] = field(default=_fail_to_retrieve, alias="retrieve")
+    _strict: bool = field(default=False, alias="strict")
 
     def __getitem__(self, uri: URI) -> Resource[D]:
         """
@@ -385,6 +445,8 @@ class Registry(Mapping[URI, Resource[D]]):
             id = resource.id()
             if id is None:
                 raise exceptions.NoInternalID(resource=resource)
+            if self._strict:
+                _check_resource_conflict(resources, id, resource)
             uncrawled = uncrawled.insert(id)
             resources = resources.insert(id, resource)
         return evolve(self, resources=resources, uncrawled=uncrawled)
@@ -495,8 +557,12 @@ class Registry(Mapping[URI, Resource[D]]):
             id = resource.id()
             if id is not None:
                 uri = urljoin(uri, id)
+                if self._strict:
+                    _check_resource_conflict(resources, uri, resource)
                 resources = resources.insert(uri, resource)
             for each in resource.anchors():
+                if self._strict:
+                    _check_anchor_conflict(anchors, uri, each)
                 anchors = anchors.insert((uri, each.name), each)
             uncrawled.extend((uri, each) for each in resource.subresources())
         return evolve(
@@ -525,6 +591,8 @@ class Registry(Mapping[URI, Resource[D]]):
             # Empty fragment URIs are equivalent to URIs without the fragment.
             # TODO: Is this true for non JSON Schema resources? Probably not.
             uri = uri.rstrip("#")
+            if self._strict:
+                _check_resource_conflict(resources, uri, resource)
             uncrawled = uncrawled.insert(uri)
             resources = resources.insert(uri, resource)
         return evolve(self, resources=resources, uncrawled=uncrawled)
@@ -553,6 +621,11 @@ class Registry(Mapping[URI, Resource[D]]):
         uncrawled = self._uncrawled
         retrieve = self._retrieve
         for registry in registries:
+            if self._strict:
+                for uri, resource in registry._resources.items():
+                    _check_resource_conflict(resources, uri, resource)
+                for key, anchor in registry._anchors.items():
+                    _check_anchor_conflict(anchors, key[0], anchor)
             resources = resources.update(registry._resources)
             anchors = anchors.update(registry._anchors)
             uncrawled = uncrawled.update(registry._uncrawled)

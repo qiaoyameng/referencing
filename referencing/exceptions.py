@@ -57,6 +57,68 @@ class NoInternalID(Exception):
         return hash(attrs.astuple(self))
 
 
+@attrs.frozen
+class ConflictingResource(Exception):
+    """
+    Two different resources were registered under the same canonical URI.
+
+    This is raised only by strict registries (see `Registry`), which refuse
+    to silently let a second resource shadow an earlier one, meaning the
+    result of loading would otherwise depend on registration or crawl order.
+
+    Re-adding a resource *equal* to one already present is always allowed,
+    so loading the same resource more than once remains idempotent.
+    """
+
+    uri: URI
+    existing: Resource[Any]
+    new: Resource[Any]
+
+    def __eq__(self, other: object) -> bool:
+        if self.__class__ is not other.__class__:
+            return NotImplemented
+        return attrs.astuple(self) == attrs.astuple(other)
+
+    def __hash__(self) -> int:
+        return hash(attrs.astuple(self))
+
+    def __str__(self) -> str:
+        return (
+            f"Different resources already exist at {self.uri!r}. "
+            "Refusing to replace one with another in a strict registry; "
+            f"the existing resource has contents {self.existing.contents!r} "
+            f"but a new resource has contents {self.new.contents!r}."
+        )
+
+
+@frozen
+class ConflictingAnchor(ConflictingResource):
+    """
+    Two different anchors with the same name were found within one resource.
+
+    As with `ConflictingResource`, this is raised only by strict registries,
+    and duplicate anchors pointing to an equal resource are allowed so that
+    repeated loading remains idempotent.
+    """
+
+    anchor: str
+
+    def __eq__(self, other: object) -> bool:
+        if self.__class__ is not other.__class__:
+            return NotImplemented
+        return attrs.astuple(self) == attrs.astuple(other)
+
+    def __hash__(self) -> int:
+        return hash(attrs.astuple(self))
+
+    def __str__(self) -> str:
+        return (
+            f"Multiple anchors named {self.anchor!r} exist within the "
+            f"resource at {self.uri!r}, and they do not refer to the same "
+            "contents."
+        )
+
+
 @frozen
 class Unretrievable(KeyError):
     """

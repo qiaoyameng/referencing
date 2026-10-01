@@ -1,6 +1,11 @@
 import pytest
 
-from referencing import Registry, Resource, Specification
+from referencing import (
+    Registry,
+    Resource,
+    Specification,
+    exceptions,
+)
 import referencing.jsonschema
 
 
@@ -380,3 +385,135 @@ def test_multiple_lookup_recursive_ref_with_nonrecursive_ref():
 
 def test_empty_registry():
     assert referencing.jsonschema.EMPTY_REGISTRY == Registry()
+
+
+SCHEMA_URI = "https://example.com/shared-schema.json"
+
+
+def _strict_registry(first, second):
+    first_resource = Resource.from_contents(
+        first,
+        default_specification=referencing.jsonschema.DRAFT202012,
+    )
+    second_resource = Resource.from_contents(
+        second,
+        default_specification=referencing.jsonschema.DRAFT202012,
+    )
+    return Registry(strict=True).with_resources(
+        [
+            ("https://example.com/first-schema.json", first_resource),
+            ("https://example.com/second-schema.json", second_resource),
+        ],
+    )
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_two_external_schemas_with_the_same_id_conflict(reverse):
+    """
+    Two external documents declaring the same ``$id`` raise, in both orders.
+    """
+
+    first = {"$id": SCHEMA_URI, "type": "string"}
+    second = {"$id": SCHEMA_URI, "type": "integer"}
+    if reverse:
+        first, second = second, first
+
+    registry = _strict_registry(first, second)
+    with pytest.raises(exceptions.ConflictingResource) as error:
+        registry.crawl()
+    assert error.value.uri == SCHEMA_URI
+    assert error.value.new.contents["type"] != error.value.existing.contents[
+        "type"
+    ]
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_conflict_hidden_in_an_uncrawled_nested_schema(reverse):
+    """
+    Explicitly loading detects a nested ``$id`` conflict not seen yet.
+    """
+
+    first = {
+        "$id": "https://example.com/first-root",
+        "$defs": {"child": {"$id": "shared", "const": "first"}},
+    }
+    second = {
+        "$id": "https://example.com/second-root",
+        "$defs": {"child": {"$id": "shared", "const": "second"}},
+    }
+    if reverse:
+        first, second = second, first
+
+    registry = _strict_registry(first, second)
+    with pytest.raises(exceptions.ConflictingResource) as error:
+        registry.crawl()
+    assert error.value.uri == "https://example.com/shared"
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_first_resolution_enforces_the_same_rule_as_crawl(reverse):
+    """
+    The first resolution into an uncrawled conflict raises just like crawl.
+    """
+
+    first = {
+        "$id": "https://example.com/first-root",
+        "$defs": {"child": {"$id": "shared", "const": "first"}},
+    }
+    second = {
+        "$id": "https://example.com/second-root",
+        "$defs": {"child": {"$id": "shared", "const": "second"}},
+    }
+    if reverse:
+        first, second = second, first
+
+    uncrawled = _strict_registry(first, second)
+
+    with pytest.raises(exceptions.ConflictingResource) as resolved:
+        uncrawled.resolver(
+            base_uri="https://example.com/first-root",
+        ).lookup("shared")
+    with pytest.raises(exceptions.ConflictingResource) as crawled:
+        uncrawled.crawl()
+    assert resolved.value == crawled.value
+
+
+def test_reloading_the_same_external_schema_is_idempotent():
+    """
+    Adding an equal resource more than once remains allowed.
+    """
+
+    resource = referencing.jsonschema.DRAFT202012.create_resource(
+        {"$id": SCHEMA_URI, "type": "string"},
+    )
+    registry = (
+        Registry(strict=True)
+        .with_resource("https://example.com/one", resource)
+        .with_resource("https://example.com/two", resource)
+        .crawl()
+    )
+    assert registry[SCHEMA_URI] == resource
+
+
+def test_a_failed_load_leaves_the_registry_usable():
+    """
+    The original immutable registry is unaffected by a failing load.
+    """
+
+    first = referencing.jsonschema.DRAFT202012.create_resource(
+        {"$id": SCHEMA_URI, "type": "string"},
+    )
+    second = referencing.jsonschema.DRAFT202012.create_resource(
+        {"$id": SCHEMA_URI, "type": "integer"},
+    )
+    registry = Registry(strict=True).with_resource(
+        "https://example.com/first-schema.json",
+        first,
+    )
+    with pytest.raises(exceptions.ConflictingResource):
+        registry.with_resource(
+            "https://example.com/second-schema.json",
+            second,
+        ).crawl()
+
+    assert registry.crawl()[SCHEMA_URI] is first

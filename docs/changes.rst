@@ -2,6 +2,14 @@
 Changelog
 =========
 
+v0.38.0
+-------
+
+* Add a strict mode to `referencing.Registry`, enabled via ``Registry(strict=True)``.
+  A strict registry raises a new ``referencing.exceptions.ConflictingResource`` error if two different resources would be registered under the same canonical URI (including relative IDs which resolve to the same absolute URI, and subresources discovered lazily while crawling or resolving), and a new ``referencing.exceptions.ConflictingAnchor`` error if different anchors share a name within one resource.
+  Re-adding a resource or anchor equal to one already present remains idempotent, and the reported conflict no longer depends on registration or crawl order.
+  As registries are immutable, a registry on which a conflicting add or crawl was attempted continues to behave normally.
+
 v0.37.0
 -------
 

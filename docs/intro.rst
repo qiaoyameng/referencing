@@ -205,6 +205,45 @@ If you have more than one resource to add, you can use `Registry.with_resources`
 You may also want to have a look at `Registry.with_contents` for a further method to add resources to a registry without constructing a `Resource` object yourself.
 
 
+Strict Registries
+~~~~~~~~~~~~~~~~~
+
+By default, if two resources somehow end up associated with the same URI, the result depends on the order in which they were added or crawled.
+If you'd prefer such situations to be detected eagerly, pass ``strict=True`` when constructing a `referencing.Registry`.
+A strict registry checks for resources which collide at the same canonical URI (including relative IDs which resolve to the same URI, and subresources discovered lazily), as well as for anchors which are duplicated within a single resource:
+
+.. testcode::
+
+    from referencing import Registry
+    from referencing.exceptions import ConflictingResource
+    from referencing.jsonschema import DRAFT202012
+
+    one = DRAFT202012.create_resource(
+        {"$id": "https://example.com/schema", "type": "string"},
+    )
+    two = DRAFT202012.create_resource(
+        {"$id": "https://example.com/schema", "type": "integer"},
+    )
+    registry = Registry(strict=True).with_resource(
+        "https://example.com/one.json",
+        one,
+    )
+    try:
+        registry.with_resource(
+            "https://example.com/two.json",
+            two,
+        ).crawl()
+    except ConflictingResource as error:
+        print(error.uri)
+
+.. testoutput::
+
+    https://example.com/schema
+
+Re-adding a resource equal to one already present is still allowed, so loading the same document more than once remains idempotent.
+Because registries are immutable, the registry on which the failing call was made is left unchanged and remains fully usable.
+
+
 Dynamically Retrieving Resources
 --------------------------------
 
