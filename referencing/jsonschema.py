@@ -7,15 +7,25 @@ from __future__ import annotations
 from collections.abc import Iterable, Sequence, Set
 from typing import Any
 
-from referencing import Anchor, Registry, Resource, Specification, exceptions
+from referencing import (
+    Anchor,
+    AsyncRegistry,
+    Registry,
+    Resource,
+    Specification,
+    exceptions,
+)
 from referencing._attrs import frozen
 from referencing._core import (
     _UNSET,  # type: ignore[reportPrivateUsage]
+    AsyncResolver as _AsyncResolver,
     Resolved as _Resolved,
     Resolver as _Resolver,
     _Unset,  # type: ignore[reportPrivateUsage]
 )
 from referencing.typing import URI, Anchor as AnchorType, Mapping
+
+_AnyResolver = _Resolver[Any] | _AsyncResolver[Any]
 
 #: A JSON Schema which is a JSON object
 ObjectSchema = Mapping[str, Any]
@@ -28,6 +38,9 @@ SchemaResource = Resource[Schema]
 
 #: A JSON Schema Registry
 SchemaRegistry = Registry[Schema]
+
+#: An asynchronous JSON Schema Registry
+AsyncSchemaRegistry = AsyncRegistry[Schema]
 
 #: The empty JSON Schema Registry
 EMPTY_REGISTRY: SchemaRegistry = Registry()
@@ -286,9 +299,9 @@ def _maybe_in_subresource(
 
     def maybe_in_subresource(
         segments: Sequence[int | str],
-        resolver: _Resolver[Any],
+        resolver: _AnyResolver,
         subresource: Resource[Any],
-    ) -> _Resolver[Any]:
+    ) -> _AnyResolver:
         _segments = iter(segments)
         for segment in _segments:
             if segment not in in_value and (
@@ -309,9 +322,9 @@ def _maybe_in_subresource_crazy_items(
 
     def maybe_in_subresource(
         segments: Sequence[int | str],
-        resolver: _Resolver[Any],
+        resolver: _AnyResolver,
         subresource: Resource[Any],
-    ) -> _Resolver[Any]:
+    ) -> _AnyResolver:
         _segments = iter(segments)
         for segment in _segments:
             if segment == "items" and isinstance(
@@ -337,9 +350,9 @@ def _maybe_in_subresource_crazy_items_dependencies(
 
     def maybe_in_subresource(
         segments: Sequence[int | str],
-        resolver: _Resolver[Any],
+        resolver: _AnyResolver,
         subresource: Resource[Any],
-    ) -> _Resolver[Any]:
+    ) -> _AnyResolver:
         _segments = iter(segments)
         for segment in _segments:
             if segment in {"items", "dependencies"} and isinstance(
@@ -601,7 +614,10 @@ class DynamicAnchor:
     name: str
     resource: SchemaResource
 
-    def resolve(self, resolver: _Resolver[Schema]) -> _Resolved[Schema]:
+    def resolve(
+        self,
+        resolver: _Resolver[Schema] | _AsyncResolver[Schema],
+    ) -> _Resolved[Schema]:
         """
         Resolve this anchor dynamically.
         """

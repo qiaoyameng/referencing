@@ -4,11 +4,16 @@ Type-annotation related support for the referencing library.
 
 from __future__ import annotations
 
-from collections.abc import Mapping as Mapping
+from collections.abc import Awaitable, Mapping as Mapping
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
 if TYPE_CHECKING:
-    from referencing._core import Resolved, Resolver, Resource
+    from referencing._core import (
+        AsyncResolver,
+        Resolved,
+        Resolver,
+        Resource,
+    )
 
 #: A URI which identifies a `Resource`.
 URI = str
@@ -34,6 +39,21 @@ class Retrieve(Protocol[D]):
         ...
 
 
+class AsyncRetrieve(Protocol[D]):
+    """
+    An asynchronous retrieval callable, usable within an `AsyncRegistry`.
+    """
+
+    async def __call__(self, uri: URI) -> Resource[D]:
+        """
+        Retrieve the resource with the given URI asynchronously.
+
+        Raise `referencing.exceptions.NoSuchResource` if you wish to indicate
+        the retriever cannot lookup the given URI.
+        """
+        ...
+
+
 class Anchor(Protocol[D]):
     """
     An anchor within a `Resource`.
@@ -49,7 +69,10 @@ class Anchor(Protocol[D]):
         """
         ...
 
-    def resolve(self, resolver: Resolver[D]) -> Resolved[D]:
+    def resolve(
+        self,
+        resolver: Resolver[D] | AsyncResolver[D],
+    ) -> Resolved[D] | Awaitable[Resolved[D]]:
         """
         Return the resource for this anchor.
         """

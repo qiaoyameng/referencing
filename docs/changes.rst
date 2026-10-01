@@ -2,6 +2,13 @@
 Changelog
 =========
 
+Unreleased
+-----
+
+* Add ``AsyncRegistry`` and its asynchronous resolver for resources supplied
+  by async storage interfaces, while preserving the existing in-memory
+  pointer and anchor semantics.
+
 v0.37.0
 -------
 

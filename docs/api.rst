@@ -35,6 +35,11 @@ Plainly then, you may rely on their methods and attributes not changing in backw
    :undoc-members:
 
 
+.. autoclass:: referencing._core.AsyncResolver
+   :members:
+   :undoc-members:
+
+
 .. autoclass:: referencing._core._MaybeInSubresource
    :members:
    :undoc-members:

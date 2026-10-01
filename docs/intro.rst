@@ -267,3 +267,47 @@ The above example would be written:
     print(resolver.lookup("https://json-schema.org/draft/2020-12/schema"))
 
 It is otherwise functionally equivalent to the above, other than that retrieval will not repeatedly make a web request.
+
+
+Asynchronously Retrieving Resources
+-----------------------------------
+
+Storage clients often expose asynchronous interfaces rather than synchronous callables.
+Use `AsyncRegistry` for these retrievers, await each lookup, and use the
+resolver returned with the resolved contents:
+
+.. code:: python
+
+    import asyncio
+
+    from referencing import AsyncRegistry
+
+
+    async def retrieve(uri):
+        ...  # Fetch and deserialize the resource asynchronously.
+
+
+    async def main():
+        registry = AsyncRegistry(retrieve=retrieve)
+        resolver = registry.resolver()
+        resolved = await resolver.lookup("https://example.com/schema")
+        return resolved.resolver
+
+
+    asyncio.run(main())
+
+The registry returned alongside each resolved resource is a new immutable
+registry containing the completed external resource.
+The original registry is not modified, so independent resolution branches do
+not share partially retrieved state.
+Resources already held in memory, including JSON pointers, plain anchors, and
+dynamic anchors, use the same resolution semantics as the synchronous
+`Resolver`.
+
+Cancellation propagates to the asynchronous retrieval operation that is
+currently being awaited.
+A cancelled retrieval does not add an incomplete resource to either the
+original registry or the registry returned by another lookup.
+A synchronous `Registry` cannot await an asynchronous retriever; attempting
+such a lookup raises a `TypeError` describing that an `AsyncRegistry` is
+required.
