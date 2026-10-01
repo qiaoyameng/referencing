@@ -163,3 +163,26 @@ class InvalidAnchor(Unresolvable):
             f"to use '#/{self.anchor}', as the slash is required *before each "
             "segment* of a JSON pointer."
         )
+
+
+@frozen
+class AsyncRetrievalRequired(Unresolvable):
+    """
+    A synchronous lookup required a resource only available asynchronously.
+
+    Synchronous `Registry` and `Resolver` methods cannot await an
+    asynchronous retriever. Use `AsyncRegistry` and `AsyncResolver` instead,
+    whose retrieval methods are coroutines.
+
+    References which point only at resources already present in memory
+    (including JSON pointers and anchors within them) remain resolvable
+    synchronously; this error is raised only when a new resource would have
+    to be fetched.
+    """
+
+    def __str__(self) -> str:
+        return (
+            f"{self.ref!r} is not present in the registry and can only be "
+            "retrieved asynchronously. Use an AsyncRegistry and "
+            "AsyncResolver (and await the lookup) instead."
+        )

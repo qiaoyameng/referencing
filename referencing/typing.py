@@ -4,7 +4,7 @@ Type-annotation related support for the referencing library.
 
 from __future__ import annotations
 
-from collections.abc import Mapping as Mapping
+from collections.abc import Coroutine, Mapping as Mapping
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
 if TYPE_CHECKING:
@@ -25,6 +25,28 @@ class Retrieve(Protocol[D]):
     """
 
     def __call__(self, uri: URI) -> Resource[D]:
+        """
+        Retrieve the resource with the given URI.
+
+        Raise `referencing.exceptions.NoSuchResource` if you wish to indicate
+        the retriever cannot lookup the given URI.
+        """
+        ...
+
+
+class AsyncRetrieve(Protocol[D]):
+    """
+    An asynchronous retrieval callable, usable within an `AsyncRegistry`.
+
+    Like `Retrieve`, but the resource is fetched from an asynchronous store
+    (e.g. a network or database client whose API is itself asynchronous), so
+    the callable is a coroutine function which must be awaited.
+
+    Cancellation of the awaiting task propagates directly into the
+    coroutine, so a fetch which has not yet completed may be cancelled.
+    """
+
+    def __call__(self, uri: URI) -> Coroutine[Any, Any, Resource[D]]:
         """
         Retrieve the resource with the given URI.
 

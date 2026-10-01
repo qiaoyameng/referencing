@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from asyncio import CancelledError
+import inspect
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from enum import Enum
 from typing import Any, ClassVar, Generic, Protocol, TypeVar
@@ -10,7 +12,14 @@ from rpds import HashTrieMap, HashTrieSet, List
 
 from referencing import exceptions
 from referencing._attrs import frozen
-from referencing.typing import URI, Anchor as AnchorType, D, Mapping, Retrieve
+from referencing.typing import (
+    URI,
+    Anchor as AnchorType,
+    AsyncRetrieve,
+    D,
+    Mapping,
+    Retrieve,
+)
 
 EMPTY_UNCRAWLED: HashTrieSet[URI] = HashTrieSet()
 EMPTY_PREVIOUS_RESOLVERS: List[URI] = List()
@@ -289,6 +298,14 @@ def _fail_to_retrieve(uri: URI):
     raise exceptions.NoSuchResource(ref=uri)
 
 
+async def _fail_to_retrieve_async(uri: URI):
+    raise exceptions.NoSuchResource(ref=uri)
+
+
+def _requires_async_retrieval(uri: URI):
+    raise exceptions.AsyncRetrievalRequired(ref=uri)
+
+
 @frozen
 class Registry(Mapping[URI, Resource[D]]):
     r"""
@@ -420,7 +437,7 @@ class Registry(Mapping[URI, Resource[D]]):
             return Retrieved(registry=registry, value=resource)
 
         try:
-            resource = registry._retrieve(uri)
+            retrieved_resource = registry._retrieve(uri)
         except (
             exceptions.CannotDetermineSpecification,
             exceptions.NoSuchResource,
@@ -428,9 +445,16 @@ class Registry(Mapping[URI, Resource[D]]):
             raise
         except Exception as error:
             raise exceptions.Unretrievable(ref=uri) from error
+        if inspect.iscoroutine(retrieved_resource):
+            # Both ``async def`` retrievers and callables which return a
+            # coroutine end up here. The coroutine body has not started, so
+            # close it (avoiding an un-awaited warning) and tell the caller
+            # clearly that an async registry/resolver is required.
+            retrieved_resource.close()
+            raise exceptions.AsyncRetrievalRequired(ref=uri)
         else:
-            registry = registry.with_resource(uri, resource)
-            return Retrieved(registry=registry, value=resource)
+            registry = registry.with_resource(uri, retrieved_resource)
+            return Retrieved(registry=registry, value=retrieved_resource)
 
     def remove(self, uri: URI):
         """
@@ -679,6 +703,8 @@ class Resolver(Generic[D]):
             raise exceptions.Unresolvable(ref=ref) from None
         except exceptions.Unretrievable as error:
             raise exceptions.Unresolvable(ref=ref) from error
+        except exceptions.AsyncRetrievalRequired:
+            raise exceptions.AsyncRetrievalRequired(ref=ref) from None
 
         if fragment.startswith("/"):
             resolver = self._evolve(registry=retrieved.registry, base_uri=uri)
@@ -732,3 +758,275 @@ class Anchor(Generic[D]):
         Return the resource for this anchor.
         """
         return Resolved(contents=self.resource.contents, resolver=resolver)
+
+
+@frozen
+class AsyncRegistry(Mapping[URI, Resource[D]]):
+    r"""
+    A registry which supports asynchronous retrieval of `Resource`\ s.
+
+    An `AsyncRegistry` mirrors a `Registry`, but URIs not already present in
+    memory are fetched from an asynchronous storage interface via a coroutine
+    retriever. Resources already in memory (including subresources found by
+    crawling, and JSON pointers or anchors within a resource) are resolved
+    using exactly the same semantics as a synchronous `Registry`.
+
+    Like `Registry`, an `AsyncRegistry` is immutable: methods which add
+    resources (including `AsyncRegistry.get_or_retrieve`) return *new*
+    registries rather than mutating the instance the caller already holds.
+
+    Construct one directly by passing an asynchronous ``retrieve`` callable,
+    or wrap an existing in-memory `Registry` with `AsyncRegistry.from_registry`.
+    """
+
+    _registry: Registry[D] = field(
+        default=Registry(),
+        alias="registry",
+    )
+    _retrieve: AsyncRetrieve[D] = field(
+        default=_fail_to_retrieve_async,
+        alias="retrieve",
+    )
+
+    def __attrs_post_init__(self) -> None:
+        # Any synchronous access path which somehow reaches the wrapped
+        # registry's retriever must produce a clear error rather than
+        # silently attempting to call the coroutine.
+        object.__setattr__(
+            self,
+            "_registry",
+            evolve(self._registry, retrieve=_requires_async_retrieval),
+        )
+
+    @classmethod
+    def from_registry(
+        cls,
+        registry: Registry[D],
+        retrieve: AsyncRetrieve[D] = _fail_to_retrieve_async,
+    ) -> AsyncRegistry[D]:
+        """
+        Wrap an existing synchronous `Registry`, adding async retrieval.
+        """
+        return cls(registry=registry, retrieve=retrieve)
+
+    def __getitem__(self, uri: URI) -> Resource[D]:
+        return self._registry[uri]
+
+    def __iter__(self) -> Iterator[URI]:
+        return iter(self._registry)
+
+    def __len__(self) -> int:
+        return len(self._registry)
+
+    def __contains__(self, uri: object) -> bool:
+        return uri in self._registry
+
+    def __rmatmul__(
+        self,
+        new: Resource[D] | Iterable[Resource[D]],
+    ) -> AsyncRegistry[D]:
+        return self._with_registry(new @ self._registry)
+
+    def __repr__(self) -> str:
+        return f"<AsyncRegistry wrapping {self._registry!r}>"
+
+    async def get_or_retrieve(self, uri: URI) -> Retrieved[D, Resource[D]]:
+        """
+        Get a resource, crawling or asynchronously retrieving if necessary.
+
+        The returned `Retrieved` carries a new, immutable registry containing
+        the fully fetched resource; the registry this method was called on is
+        left unchanged. If the awaiting task is cancelled before the fetch
+        completes, the cancellation propagates into the fetch and no partial
+        resource is added to any registry.
+        """
+        resource = self._registry._resources.get(uri)
+        if resource is not None:
+            return Retrieved(registry=self, value=resource)
+
+        registry = self._registry.crawl()
+        resource = registry._resources.get(uri)
+        if resource is not None:
+            return Retrieved(registry=self._with_registry(registry), value=resource)
+
+        try:
+            resource = await self._retrieve(uri)
+        except (
+            CancelledError,
+            exceptions.CannotDetermineSpecification,
+            exceptions.NoSuchResource,
+        ):
+            raise
+        except Exception as error:
+            raise exceptions.Unretrievable(ref=uri) from error
+        else:
+            registry = registry.with_resource(uri, resource)
+            return Retrieved(
+                registry=self._with_registry(registry),
+                value=resource,
+            )
+
+    def remove(self, uri: URI) -> AsyncRegistry[D]:
+        return self._with_registry(self._registry.remove(uri))
+
+    def anchor(self, uri: URI, name: str) -> Retrieved[D, AnchorType[D]]:
+        """
+        Retrieve a given anchor from a resource which must already be crawled.
+
+        Only resources present in memory are considered -- use
+        `AsyncResolver.lookup` to first fetch a resource asynchronously.
+        """
+        retrieved = self._registry.anchor(uri, name)
+        return Retrieved(
+            value=retrieved.value,
+            registry=self._with_registry(retrieved.registry),
+        )
+
+    def contents(self, uri: URI) -> D:
+        return self._registry.contents(uri)
+
+    def crawl(self) -> AsyncRegistry[D]:
+        return self._with_registry(self._registry.crawl())
+
+    def with_resource(self, uri: URI, resource: Resource[D]) -> AsyncRegistry[D]:
+        return self._with_registry(self._registry.with_resource(uri, resource))
+
+    def with_resources(
+        self,
+        pairs: Iterable[tuple[URI, Resource[D]]],
+    ) -> AsyncRegistry[D]:
+        return self._with_registry(self._registry.with_resources(pairs))
+
+    def with_contents(
+        self,
+        pairs: Iterable[tuple[URI, D]],
+        **kwargs: Any,
+    ) -> AsyncRegistry[D]:
+        return self._with_registry(self._registry.with_contents(pairs, **kwargs))
+
+    def combine(self, *registries: AsyncRegistry[D]) -> AsyncRegistry[D]:
+        """
+        Combine together one or more other async registries.
+        """
+        if registries == (self,):
+            return self
+        retrieve = self._retrieve
+        others: list[Registry[D]] = []
+        for registry in registries:
+            if registry._retrieve is not _fail_to_retrieve_async:
+                if (
+                    registry._retrieve is not retrieve
+                    is not _fail_to_retrieve_async
+                ):
+                    raise ValueError(  # noqa: TRY003
+                        "Cannot combine registries with conflicting "
+                        "retrieval functions.",
+                    )
+                retrieve = registry._retrieve
+            others.append(registry._registry)
+        return self._with_registry(
+            self._registry.combine(*others),
+            retrieve=retrieve,
+        )
+
+    def resolver(self, base_uri: URI = "") -> AsyncResolver[D]:
+        """
+        Return an `AsyncResolver` which resolves against this registry.
+        """
+        return AsyncResolver(base_uri=base_uri, registry=self)
+
+    def resolver_with_root(
+        self,
+        resource: Resource[D],
+    ) -> AsyncResolver[D]:
+        """
+        Return an `AsyncResolver` with a specific root resource.
+        """
+        uri = resource.id() or ""
+        return AsyncResolver(
+            base_uri=uri,
+            registry=self.with_resource(uri, resource),
+        )
+
+    def _with_registry(
+        self,
+        registry: Registry[D],
+        retrieve: AsyncRetrieve[D] | _Unset = _UNSET,
+    ) -> AsyncRegistry[D]:
+        if retrieve is _UNSET:
+            retrieve = self._retrieve
+        return type(self)(registry=registry, retrieve=retrieve)
+
+
+@frozen
+class AsyncResolver(Generic[D]):
+    """
+    An asynchronous reference resolver.
+
+    Mirrors `Resolver`, pairing a base URI with an `AsyncRegistry`. References
+    which require fetching a new resource are awaited; pointers and anchors
+    within resources already in memory reuse the same (synchronous) semantics
+    as `Resolver`, including dynamic anchors which walk the dynamic scope.
+    """
+
+    _base_uri: URI = field(alias="base_uri")
+    _registry: AsyncRegistry[D] = field(alias="registry")
+    _previous: List[URI] = field(default=List(), repr=False, alias="previous")
+
+    async def lookup(self, ref: URI) -> Resolved[D]:
+        """
+        Resolve the given reference, awaiting external retrieval if needed.
+
+        Raises the same exceptions as `Resolver.lookup`
+        (`Unresolvable`, `NoSuchAnchor`, `PointerToNowhere`). Cancellation of
+        the awaiting task propagates to the in-flight fetch; resources fully
+        fetched earlier in a reference chain are returned in the registry of
+        intermediate `Resolved` objects and are not lost.
+        """
+        if ref.startswith("#"):
+            uri, fragment = self._base_uri, ref[1:]
+        else:
+            uri, fragment = urldefrag(urljoin(self._base_uri, ref))
+        try:
+            retrieved = await self._registry.get_or_retrieve(uri)
+        except exceptions.NoSuchResource:
+            raise exceptions.Unresolvable(ref=ref) from None
+        except exceptions.Unretrievable as error:
+            raise exceptions.Unresolvable(ref=ref) from error
+
+        if fragment.startswith("/"):
+            resolver = self._evolve(registry=retrieved.registry, base_uri=uri)
+            return retrieved.value.pointer(pointer=fragment, resolver=resolver)
+
+        if fragment:
+            retrieved = retrieved.registry.anchor(uri, fragment)
+            resolver = self._evolve(registry=retrieved.registry, base_uri=uri)
+            return retrieved.value.resolve(resolver=resolver)
+
+        resolver = self._evolve(registry=retrieved.registry, base_uri=uri)
+        return Resolved(contents=retrieved.value.contents, resolver=resolver)
+
+    def in_subresource(self, subresource: Resource[D]) -> AsyncResolver[D]:
+        """
+        Create a resolver for a subresource (which may have a new base URI).
+        """
+        id = subresource.id()
+        if id is None:
+            return self
+        return evolve(self, base_uri=urljoin(self._base_uri, id))
+
+    def dynamic_scope(self) -> Iterable[tuple[URI, AsyncRegistry[D]]]:
+        """
+        In specs with such a notion, return the URIs in the dynamic scope.
+        """
+        for uri in self._previous:
+            yield uri, self._registry
+
+    def _evolve(self, base_uri: URI, **kwargs: Any):
+        """
+        Evolve, appending to the dynamic scope.
+        """
+        previous = self._previous
+        if self._base_uri and (not previous or base_uri != self._base_uri):
+            previous = previous.push_front(self._base_uri)
+        return evolve(self, base_uri=base_uri, previous=previous, **kwargs)
